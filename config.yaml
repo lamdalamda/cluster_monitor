@@ -1,0 +1,45 @@
+# HPC Job Dashboard 配置文件
+#
+# clusters 下每一项对应一个 Slurm 集群。ssh_host 建议使用你 ~/.ssh/config 里
+# 已经配置好的 Host 别名（这样 ProxyJump / IdentityFile / 端口跳板机等设置
+# 都会自动生效，不用在这里重复配置）。
+#
+# 例如你的 ~/.ssh/config 里有：
+#   Host clusterA
+#       HostName login.clusterA.example.edu
+#       User yourname
+#       ProxyJump bastion
+# 那这里 ssh_host 就填 clusterA。
+#
+# 前提：能免密登录（SSH key + agent，或者 key 没加密码）。这个程序不会处理
+# 交互式密码输入。
+
+clusters:
+  - name: ClusterA          # 显示用的名字，随便起
+    ssh_host: clusterA      # ssh_host 对应 ~/.ssh/config 里的 Host
+    enabled: true
+
+  - name: ClusterB
+    ssh_host: clusterB
+    enabled: true
+
+  # 用完就删或者 enabled: false
+  # - name: OldSGE
+  #   ssh_host: sge-login
+  #   enabled: false
+
+# 多久轮询一次所有集群（秒）。SSH 有开销，别设太小；10-20秒比较合适。
+poll_interval_seconds: 15
+
+# sacct 往前查多少小时的历史作业（用来把已经跑完/失败的 job 也在依赖图里显示出来，
+# 否则依赖链里指向一个"已经不在squeue里"的job时就只能显示"未知"）。
+history_hours: 48
+
+# SSH 单次命令超时（秒）
+ssh_timeout_seconds: 15
+
+# Flask 监听地址和端口
+# 只在本机用：127.0.0.1（默认，更安全）
+# 想在同一局域网内用手机/其他机器打开：改成 0.0.0.0（注意：job名字等信息就暴露在局域网了）
+host: 127.0.0.1
+port: 8787
