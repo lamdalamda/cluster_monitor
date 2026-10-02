@@ -2,10 +2,16 @@
 """
 HPC Job Dashboard
 ==================
-在本机跑一个小 Flask 服务，后台线程定期通过 `ssh <host> squeue/sacct/sacctmgr`
+在本机跑一个小 Flask 服务，通过 `ssh <host> squeue/sacct/sacctmgr/...`
 拉取你在各个 Slurm 集群上的作业状态，网页上用表格展示：
-- 同名 job（通常是一条 dependency 链 / 同一批提交）折叠成一行，点三角展开
+- 同名 job（通常是一条 dependency 链 / 同一批提交）折叠成一行，点三角展开；
+  展开时顺便看每个 job 工作目录里的文件（ls + tail vasp.out / Slab*.log）
 - 每个集群一张 QoS 表：你在每个 QoS 上跑了/排了多少，全集群排队情况，QoS 限额
+- 排队积压估计（backlog.py）
+
+网页和 SSH 是解耦的：所有远程操作放进一个后台任务队列，一个接一个执行，
+网页随时打开都是立刻显示（上一次的数据会存到 .dashboard_cache.json），
+上方进度条显示后台正在干什么。默认不自动刷新，点"立即刷新"才去拉。
 
 用法：
     pip install -r requirements.txt
@@ -23,16 +29,20 @@ import re
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 from datetime import datetime, timezone
 
 import yaml
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 
 import backlog
+import jobfiles
 
 CONFIG_PATH = "config.yaml"
-ASKPASS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ssh_askpass_abort.sh")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+ASKPASS = os.path.join(APP_DIR, "ssh_askpass_abort.sh")
+CACHE_PATH = os.path.join(APP_DIR, ".dashboard_cache.json")
+INSPECT_CHUNK = 8  # 每次 SSH 看几个 job 的目录
 
 SQUEUE_FIELDS = [
     "jobid",
@@ -49,9 +59,10 @@ SQUEUE_FIELDS = [
     "start",
     "cpus",
     "tres",
+    "workdir",
     "dependency",
 ]
-SQUEUE_FORMAT = "%i|%P|%j|%u|%T|%M|%l|%D|%R|%q|%V|%S|%C|%b|%E"
+SQUEUE_FORMAT = "%i|%P|%j|%u|%T|%M|%l|%D|%R|%q|%V|%S|%C|%b|%Z|%E"
 
 SACCT_FIELDS = [
     "jobid",
@@ -65,8 +76,11 @@ SACCT_FIELDS = [
     "submit",
     "start",
     "end",
+    "workdir",
 ]
-SACCT_FORMAT = "JobID,JobName,State,Partition,QOS,NodeList,Elapsed,Timelimit,Submit,Start,End"
+SACCT_FORMAT = (
+    "JobID,JobName,State,Partition,QOS,NodeList,Elapsed,Timelimit,Submit,Start,End,WorkDir"
+)
 
 QOS_LIMIT_FIELDS = ["name", "max_jobs_pu", "max_submit_pu", "max_wall", "max_tres_pu"]
 QOS_LIMIT_FORMAT = "Name,MaxJobsPU,MaxSubmitPU,MaxWall,MaxTRESPU"
@@ -206,6 +220,7 @@ def parse_squeue(lines, cluster_name):
             "end": "",
             "cpus": rec["cpus"],
             "tres": rec["tres"] if rec["tres"] not in ("N/A", "(null)") else "",
+            "workdir": rec["workdir"],
             "dependency_raw": rec["dependency"] if rec["dependency"] != "(null)" else "",
             "deps": parse_dependency(rec["dependency"]),
             "source": "squeue",
@@ -239,6 +254,7 @@ def parse_sacct(lines, cluster_name):
             "submit": clean_time(rec["submit"]),
             "start": clean_time(rec["start"]),
             "end": clean_time(rec["end"]),
+            "workdir": rec["workdir"],
             "dependency_raw": "",
             "deps": [],
             "source": "sacct",
@@ -295,20 +311,284 @@ def normalize_qos_config(raw):
     return out
 
 
-class Poller:
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+class Backend:
+    """所有 SSH 操作都放进 self.queue，由一个后台线程依次执行；网页只读 self 里的结果。"""
+
     def __init__(self, config):
         self.config = config
         self.lock = threading.Lock()
-        self.poll_lock = threading.Lock()  # 防止后台轮询和"立即刷新"同时跑
-        self.state = {"jobs": [], "clusters": [], "updated_at": None, "errors": []}
-        # sacctmgr 的 QoS 信息基本不变，缓存起来，不用每轮都查
+        self.cv = threading.Condition(self.lock)
+        self.queue = deque()  # 待执行任务 {"kind", "label", "steps", ...}
+        self.current = None  # 正在执行的任务
+        self.step_label = ""  # 正在执行的那一步
+        self.batch_total = 0  # 这一批（从空闲到再次空闲）一共多少步，给进度条用
+        self.batch_done = 0
+        self.version = 0  # 数据每变一次 +1，前端据此决定要不要重新拉 /api/jobs
+        self.last_refresh = None
+        self.results = {}  # cluster name -> 给前端的集群结果（连不上时是旧数据 + 错误）
+        self.last_good = {}  # cluster name -> 上一次成功的结果
+        self.inspect = {}  # "cluster:jobid" -> 目录信息
+        self.inspect_pending = set()
+        # sacctmgr 的 QoS 信息基本不变，缓存起来，不用每次都查
         self.qos_info = {}  # cluster name -> {"assoc": [...], "limits": {...}, "fetched_at": t}
         # 排队积压要拉全集群的 squeue，比较重，隔几分钟才拉一次
         self.backlog = {}  # cluster name -> {"result": {...}, "model": {...}, "fetched_at": t}
         # 需要 2FA 的集群：先停一阵子不自动重试（"立即刷新"会强制重试）
         self.auth_blocked = {}  # cluster name -> {"until": t, "error": str}
-        self.last_good = {}  # cluster name -> 上一次成功的结果（连不上时继续显示，标成旧数据）
-        self._stop = False
+        self.load_cache()
+
+    def clusters(self):
+        return [c for c in self.config.get("clusters", []) if c.get("enabled", True)]
+
+    def cluster_by_name(self, name):
+        return next((c for c in self.clusters() if c["name"] == name), None)
+
+    # ---------------- 磁盘缓存：重启后网页立刻有上次的数据 ----------------
+    def load_cache(self):
+        try:
+            with open(CACHE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        self.last_good = data.get("last_good", {})
+        self.results = data.get("results", {})
+        self.inspect = data.get("inspect", {})
+        self.qos_info = data.get("qos_info", {})
+        self.backlog = data.get("backlog", {})
+        self.last_refresh = data.get("last_refresh")
+
+    def save_cache(self):
+        with self.lock:
+            data = json.dumps({
+                "last_good": self.last_good, "results": self.results, "inspect": self.inspect,
+                "qos_info": self.qos_info, "backlog": self.backlog,
+                "last_refresh": self.last_refresh,
+            }, ensure_ascii=False)
+        tmp = CACHE_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(data)
+            os.replace(tmp, CACHE_PATH)
+        except OSError:
+            pass
+
+    # ---------------- 任务队列 ----------------
+    def _enqueue(self, task):
+        # 调用方已持有 self.lock
+        self.queue.append(task)
+        self.batch_total += task["steps"]
+        self.version += 1
+        self.cv.notify()
+
+    def enqueue_refresh(self, force=True):
+        with self.lock:
+            if any(t["kind"] == "refresh" for t in self.queue):
+                return False  # 已经排着一个刷新了
+            n = len(self.clusters())
+            self._enqueue({"kind": "refresh", "label": "刷新作业状态", "steps": n, "force": force})
+            return True
+
+    def enqueue_inspect(self, keys, force=False):
+        """keys: ["cluster:jobid", ...]。已经看过的（除非 force）和正在排队的跳过。"""
+        by_cluster = {}
+        with self.lock:
+            for key in dict.fromkeys(keys):
+                if key in self.inspect_pending or (key in self.inspect and not force):
+                    continue
+                cluster, _, jid = key.partition(":")
+                if not self.cluster_by_name(cluster):
+                    continue
+                by_cluster.setdefault(cluster, []).append(jid)
+            added = 0
+            for cluster, ids in by_cluster.items():
+                for i in range(0, len(ids), INSPECT_CHUNK):
+                    chunk = ids[i:i + INSPECT_CHUNK]
+                    self.inspect_pending.update(f"{cluster}:{j}" for j in chunk)
+                    self._enqueue({"kind": "inspect", "cluster": cluster, "ids": chunk,
+                                   "label": f"查看 {cluster} 上 {len(chunk)} 个 job 的目录",
+                                   "steps": 1})
+                    added += len(chunk)
+            return added
+
+    def worker(self):
+        while True:
+            with self.lock:
+                while not self.queue:
+                    self.cv.wait()
+                self.current = self.queue.popleft()
+            task = self.current
+            try:
+                if task["kind"] == "refresh":
+                    self.run_refresh(task)
+                else:
+                    self.run_inspect(task)
+            except Exception as e:  # noqa: BLE001
+                with self.lock:
+                    self.results.setdefault("_errors", {})["worker"] = f"后台任务出错: {e}"
+            finally:
+                with self.lock:
+                    self.current = None
+                    self.step_label = ""
+                    if not self.queue:
+                        self.batch_total = self.batch_done = 0
+                    self.version += 1
+                self.save_cache()
+
+    def _step(self, label):
+        with self.lock:
+            self.step_label = label
+            self.version += 1
+
+    def _step_done(self):
+        with self.lock:
+            self.batch_done += 1
+            self.version += 1
+
+    def run_refresh(self, task):
+        clusters = self.clusters()
+        for i, c in enumerate(clusters, 1):
+            self._step(f"刷新 {c['name']}（{i}/{len(clusters)}）")
+            r = self.poll_cluster(c, task.get("force", True))
+            with self.lock:
+                self.store_result(r)
+            self._step_done()
+            self.save_cache()
+        with self.lock:
+            self.last_refresh = now_iso()
+            self.results.get("_errors", {}).pop("worker", None)
+
+    def store_result(self, r):
+        name = r["name"]
+        if r["ok"]:
+            r["at"] = now_iso()
+            r["stale_since"] = None
+            self.last_good[name] = r
+            self.results[name] = r
+            return
+        prev = self.last_good.get(name)
+        if prev:  # 连不上时继续显示上一次的数据，前端标成旧数据
+            self.results[name] = {**prev, "ok": False, "error": r["error"],
+                                  "need_input": r.get("need_input", False), "warnings": [],
+                                  "stale_since": prev["at"]}
+        else:
+            self.results[name] = {**r, "at": None, "stale_since": None}
+
+    def run_inspect(self, task):
+        cluster, ids = task["cluster"], task["ids"]
+        self._step(task["label"])
+        c = self.cluster_by_name(cluster)
+        keys = [f"{cluster}:{j}" for j in ids]
+        try:
+            with self.lock:
+                known = (self.last_good.get(cluster) or {}).get("jobs", {})
+                todo = [(j, known.get(j, {}).get("workdir", "")) for j in ids]
+            results = {}
+            for j, d in todo:
+                if not d:
+                    results[j] = {"error": "没有工作目录信息（squeue/sacct 里没查到 WorkDir）"}
+            todo = [(j, d) for j, d in todo if d]
+            blocked = self.auth_blocked.get(cluster)
+            if todo and c and blocked and time.time() < blocked["until"]:
+                for j, _ in todo:
+                    results[j] = {"error": "集群需要 2FA，先在终端登录一次再试"}
+                todo = []
+            if todo and c:
+                cfg = self.config
+                cmd = jobfiles.build_cmd(
+                    todo, cfg.get("inspect_files", jobfiles.DEFAULT_PATTERNS),
+                    cfg.get("inspect_tail_lines", 30))
+                try:
+                    ok, out, err = run_ssh(c["ssh_host"], cmd,
+                                           cfg.get("ssh_timeout_seconds", 15) * 2)
+                except NeedInput as e:
+                    ok, out, err = False, "", f"需要交互输入（2FA/密码）：{e}"
+                parsed = jobfiles.parse_output(out) if ok else {}
+                for j, d in todo:
+                    if not ok:
+                        results[j] = {"error": err or "ssh 失败"}
+                    elif j in parsed:
+                        results[j] = {**parsed[j], "dir": d}
+                    else:
+                        results[j] = {"error": "没拿到输出", "dir": d}
+            with self.lock:
+                for j, res in results.items():
+                    self.inspect[f"{cluster}:{j}"] = {**res, "at": now_iso()}
+        finally:
+            with self.lock:
+                self.inspect_pending.difference_update(keys)
+            self._step_done()
+
+    def auto_refresh_loop(self, minutes):
+        while True:
+            time.sleep(minutes * 60)
+            self.enqueue_refresh(force=False)
+
+    def start(self):
+        threading.Thread(target=self.worker, daemon=True).start()
+        minutes = self.config.get("auto_refresh_minutes", 0) or 0
+        if minutes > 0:
+            threading.Thread(target=self.auto_refresh_loop, args=(minutes,), daemon=True).start()
+        # 默认不自动刷新；但如果一次都没拉过（没有缓存），启动时拉一次
+        if self.config.get("refresh_on_start", False) or not self.last_good:
+            self.enqueue_refresh(force=True)
+
+    # ---------------- 给前端的数据 ----------------
+    def progress(self):
+        # 调用方已持有 self.lock
+        busy = self.current is not None or bool(self.queue)
+        return {
+            "busy": busy,
+            "label": self.step_label or (self.current or {}).get("label", ""),
+            "done": self.batch_done,
+            "total": self.batch_total,
+            "queued": len(self.queue),
+            "refresh_queued": any(t["kind"] == "refresh" for t in self.queue)
+                              or (self.current or {}).get("kind") == "refresh",
+        }
+
+    def get_status(self):
+        with self.lock:
+            return {"version": self.version, "progress": self.progress()}
+
+    def get_state(self):
+        with self.lock:
+            clusters, jobs, errors = [], [], []
+            for c in self.clusters():
+                name = c["name"]
+                r = self.results.get(name)
+                if not r:
+                    clusters.append({"name": name, "ok": None, "error": None, "qos": [],
+                                     "backlog": None, "at": None, "never": True})
+                    continue
+                if not r["ok"]:
+                    errors.append(f"{name}: {r['error']}")
+                errors.extend(f"{name}: {w}" for w in r.get("warnings", []))
+                stale = bool(r.get("stale_since"))
+                for j in r.get("jobs", {}).values():
+                    jobs.append({**j, "stale": stale})
+                clusters.append({
+                    "name": name, "ok": r["ok"], "error": r.get("error"),
+                    "need_input": r.get("need_input", False),
+                    "stale_since": r.get("stale_since"), "at": r.get("at"),
+                    "load_private": r.get("load_private", False), "qos": r.get("qos", []),
+                    "backlog": r.get("backlog"),
+                })
+            errors.extend(self.results.get("_errors", {}).values())
+            keys = {f"{j['cluster']}:{j['id']}" for j in jobs}
+            return json.loads(json.dumps({
+                "version": self.version,
+                "progress": self.progress(),
+                "jobs": jobs,
+                "clusters": clusters,
+                "updated_at": self.last_refresh,
+                "errors": errors,
+                "inspect": {k: v for k, v in self.inspect.items() if k in keys},
+                "inspect_pending": sorted(self.inspect_pending & keys),
+            }))
 
     def poll_cluster(self, c, force=False):
         cfg = self.config
@@ -450,65 +730,10 @@ class Poller:
             })
         return table
 
-    def poll_once(self, force=False):
-        with self.poll_lock:
-            clusters = [c for c in self.config.get("clusters", []) if c.get("enabled", True)]
-            with ThreadPoolExecutor(max_workers=max(1, len(clusters))) as ex:
-                results = list(ex.map(lambda c: self.poll_cluster(c, force), clusters))
-
-            all_jobs, errors, cluster_status = [], [], []
-            for r in results:
-                stale_since = None
-                if r["ok"]:
-                    r["at"] = datetime.now(timezone.utc).isoformat()
-                    self.last_good[r["name"]] = r
-                else:
-                    errors.append(f"{r['name']}: {r['error']}")
-                    prev = self.last_good.get(r["name"])
-                    if prev:  # 连不上时继续显示上一次的数据，前端标成旧数据
-                        r = {**prev, "ok": False, "error": r["error"],
-                             "need_input": r.get("need_input", False), "warnings": []}
-                        stale_since = prev["at"]
-                errors.extend(f"{r['name']}: {w}" for w in r["warnings"])
-                for j in r["jobs"].values():
-                    all_jobs.append({**j, "stale": bool(stale_since)})
-                cluster_status.append({
-                    "name": r["name"], "ok": r["ok"], "error": r["error"],
-                    "need_input": r.get("need_input", False), "stale_since": stale_since,
-                    "load_private": r.get("load_private", False), "qos": r["qos"],
-                    "backlog": r.get("backlog"),
-                })
-
-            with self.lock:
-                self.state = {
-                    "jobs": all_jobs,
-                    "clusters": cluster_status,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "errors": errors,
-                }
-
-    def loop(self):
-        interval = self.config.get("poll_interval_seconds", 15)
-        while not self._stop:
-            try:
-                self.poll_once()
-            except Exception as e:  # noqa: BLE001
-                with self.lock:
-                    self.state["errors"] = [f"poll loop error: {e}"]
-            time.sleep(interval)
-
-    def get_state(self):
-        with self.lock:
-            return json.loads(json.dumps(self.state))
-
-    def start(self):
-        t = threading.Thread(target=self.loop, daemon=True)
-        t.start()
-
 
 app = Flask(__name__)
 config = load_config()
-poller = Poller(config)
+backend = Backend(config)
 
 
 @app.route("/")
@@ -518,17 +743,31 @@ def index():
 
 @app.route("/api/jobs")
 def api_jobs():
-    return jsonify(poller.get_state())
+    return jsonify(backend.get_state())
+
+
+@app.route("/api/status")
+def api_status():
+    """很轻：前端每秒问一次，版本号变了才去拉 /api/jobs"""
+    return jsonify(backend.get_status())
 
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
-    """手动触发一次立即刷新（不等下一个轮询周期）"""
-    poller.poll_once(force=True)
-    return jsonify({"ok": True})
+    """把一次刷新放进后台队列，马上返回（不等 SSH）"""
+    queued = backend.enqueue_refresh(force=True)
+    return jsonify({"ok": True, "queued": queued})
+
+
+@app.route("/api/inspect", methods=["POST"])
+def api_inspect():
+    """看一批 job 的工作目录（放进后台队列）。body: {"keys": ["cluster:jobid", ...], "force": bool}"""
+    body = request.get_json(silent=True) or {}
+    added = backend.enqueue_inspect(body.get("keys", []), bool(body.get("force")))
+    return jsonify({"ok": True, "added": added})
 
 
 if __name__ == "__main__":
-    poller.poll_once()  # 启动时先同步跑一次，避免打开页面时是空的
-    poller.start()
-    app.run(host=config.get("host", "127.0.0.1"), port=config.get("port", 8787), debug=False)
+    backend.start()
+    app.run(host=config.get("host", "127.0.0.1"), port=config.get("port", 8787), debug=False,
+            threaded=True)

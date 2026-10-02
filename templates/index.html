@@ -58,6 +58,7 @@
   #jobs tbody tr.grp:hover, #jobs tbody tr.one:hover{background:var(--row-hover);}
   #jobs tr.child{background:var(--child);}
   #jobs tr.child td{border-bottom-color:#1d212b;}
+  #jobs tr.child:has(+ tr.detail) td{border-bottom:none;padding-bottom:2px;}
   #jobs tr.child td.name{padding-left:28px;color:var(--muted);}
   #jobs tr.flash{animation:flash 1.6s ease-out;}
   @keyframes flash{0%{background:#2c4a80;}100%{background:transparent;}}
@@ -100,6 +101,32 @@
   .tag.auth{background:#4a3b10;color:var(--warn);}
   #jobs tr.stale td{opacity:.55;}
   .est{margin-left:6px;font-size:12px;}
+  /* 后台进度 */
+  #prog{position:absolute;left:0;right:0;bottom:-1px;height:3px;background:transparent;overflow:hidden;}
+  #progBar{height:100%;width:0;background:var(--accent);transition:width .3s;}
+  #prog.busy #progBar.indet{width:30%;animation:indet 1.2s linear infinite;}
+  @keyframes indet{0%{margin-left:-30%;}100%{margin-left:100%;}}
+  #progText{color:#9db8f5;}
+  button:disabled{opacity:.6;cursor:default;}
+  .card-h .at{margin-left:auto;font-weight:400;}
+
+  /* job 目录信息 */
+  #jobs tr.detail td{padding:0 10px 5px;line-height:1.5;background:var(--child);white-space:normal;border-bottom:1px solid var(--border);}
+  #jobs tr.child + tr.detail td{border-top:none;}
+  .insp{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;font-size:12px;padding-left:18px;}
+  .insp .path{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--muted);cursor:copy;}
+  .insp .path:hover{color:var(--accent);}
+  .insp .ff b{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:500;}
+  .insp .v{font-variant-numeric:tabular-nums;}
+  .insp .last{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--muted);font-size:11px;}
+  .insp button{font-size:11px;padding:1px 8px;}
+  .ok-tag{display:inline-block;font-size:10px;padding:0 5px;border-radius:3px;background:#173a26;color:var(--ok);}
+  .bad-tag{display:inline-block;font-size:10px;padding:0 5px;border-radius:3px;background:#4a1c1c;color:#ff9d9d;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle;}
+  .insp-full{display:grid;grid-template-columns:minmax(260px,1fr) 2fr;gap:10px;margin:8px 0 2px 18px;}
+  .insp-full pre{margin:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:11px;line-height:1.45;max-height:340px;overflow:auto;white-space:pre;}
+  .insp-full h4{margin:0 0 4px;font-size:11px;font-weight:500;color:var(--muted);}
+  .insp-full .tails{display:flex;flex-direction:column;gap:8px;min-width:0;}
+  @media (max-width:900px){ .insp-full{grid-template-columns:1fr;} }
   #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--border);padding:6px 14px;border-radius:6px;opacity:0;transition:opacity .2s;pointer-events:none;}
   #toast.show{opacity:1;}
   @media (max-width:640px){
@@ -127,8 +154,10 @@
   </select>
   <input type="text" id="searchBox" placeholder="搜索 job id / 名字 / 节点 / QoS">
   <span class="spacer"></span>
+  <span class="muted" id="progText"></span>
   <span class="muted" id="summary"></span>
   <button id="refreshBtn" class="primary">立即刷新</button>
+  <div id="prog"><div id="progBar"></div></div>
 </header>
 
 <main>
@@ -150,7 +179,7 @@
   <div id="blNote" class="muted" style="margin:-8px 0 18px"></div>
 
   <h2>Jobs <button id="expandAll">全部展开</button><button id="collapseAll">全部收起</button>
-    <span class="muted">同集群、同名字的 job 收在一行里 · 点 Job ID 复制</span></h2>
+    <span class="muted">同集群、同名字的 job 收在一行里 · 展开后会读取每个 job 的工作目录 · 点 Job ID / 路径复制</span></h2>
   <div class="tablewrap">
     <table id="jobs">
       <thead><tr>
@@ -198,6 +227,9 @@ let filters = Object.assign({cluster:"", qos:"", state:"", search:""}, loadPref(
 filters.search = "";
 let qosCollapsed = loadPref("qosCollapsed", false);
 let blCollapsed = loadPref("blCollapsed", false);
+let detailOpen = new Set();      // 展开了"详情"（ls + tail 全文）的 job
+let requested = new Set();       // 这次打开页面已经请求过读取目录的 job
+let pendingInspect = new Set();
 let lastData = null;
 let jobsByKey = {};
 let groupOfJob = {};
@@ -339,18 +371,77 @@ function groupRow(g){
   </tr>`;
 }
 
+// ---------------- job 目录信息 ----------------
+const fmtSize = n => n < 1024 ? n + "B" : n < 1048576 ? (n / 1024).toFixed(0) + "K" : n < 1073741824 ? (n / 1048576).toFixed(1) + "M" : (n / 1073741824).toFixed(1) + "G";
+const shortPath = p => { const a = p.split("/").filter(Boolean); return a.length > 2 ? "…/" + a.slice(-2).join("/") : p; };
+const fnum = (v, d) => v === null || v === undefined ? "?" : v.toFixed(d);
+const fexp = v => v === null || v === undefined ? "?" : v.toExponential(1);
+
+function fileSummary(f){
+  const p = f.parsed || {};
+  const bits = [];
+  if (p.ionic_step !== undefined) bits.push(`离子步 <span class="v">${p.ionic_step}</span>`, `F <span class="v">${fnum(p.F, 4)}</span>`, `dE <span class="v">${fexp(p.dE)}</span>`);
+  if (p.elec_step !== undefined) bits.push(`${esc(p.elec_algo)} <span class="v">${p.elec_step}</span>`);
+  if (p.mag !== undefined) bits.push(`mag <span class="v">${fnum(p.mag, 2)}</span>`);
+  if (p.converged) bits.push(`<span class="ok-tag">已收敛</span>`);
+  if (p.error) bits.push(`<span class="bad-tag" title="${esc(p.error)}">${esc(p.error)}</span>`);
+  if (!bits.length && p.last_line) bits.push(`<span class="last" title="${esc(p.last_line)}">${esc(p.last_line.slice(0, 90))}</span>`);
+  return `<span class="ff"><b>${esc(f.name)}</b> <span class="muted">${esc(f.mtime || "")}</span> ${bits.join(" · ")}</span>`;
+}
+
+function detailRow(j){
+  const k = jobKey(j), ins = (lastData.inspect || {})[k], pending = pendingInspect.has(k);
+  const reload = `<button data-insp-reload="${esc(k)}"${pending ? " disabled" : ""}>${pending ? "读取中…" : ins ? "重新读取" : "读取"}</button>`;
+  let body;
+  if (!ins){
+    body = pending ? `<span class="muted">排队读取工作目录…</span>` : `<span class="muted">还没读取工作目录</span> ${reload}`;
+  } else if (ins.error){
+    body = `<span class="bad-tag" title="${esc(ins.error)}">${esc(ins.error)}</span> ${reload}`;
+  } else {
+    const path = `<span class="path" data-copy="${esc(ins.dir)}" title="${esc(ins.dir)}（点击复制）">${esc(shortPath(ins.dir))}</span>`;
+    if (!ins.exists){
+      body = `${path} <span class="bad-tag">目录不存在或没权限</span> ${reload}`;
+    } else {
+      const files = ins.files.length ? ins.files.map(fileSummary).join("") : `<span class="muted">没有匹配的输出文件</span>`;
+      const open = detailOpen.has(k);
+      body = `${path}<span class="muted">${ins.count ?? "?"} 个文件</span>${files}
+        <button data-insp-toggle="${esc(k)}">${open ? "收起详情" : "详情"}</button>${reload}
+        <span class="muted">读取于 ${localTime(ins.at)}</span>`;
+      if (open){
+        const ls = ins.ls.map(e => `${e.mtime}  ${fmtSize(e.size).padStart(6)}  ${e.name}${e.is_dir ? "/" : ""}`).join("\n");
+        const more = ins.count > ins.ls.length ? `\n…（共 ${ins.count} 个，只显示最新的 ${ins.ls.length} 个）` : "";
+        const tails = ins.files.map(f => `<div><h4>tail ${esc(f.name)}</h4><pre>${esc(f.tail.join("\n"))}</pre></div>`).join("");
+        body += `</div><div class="insp-full"><div><h4>ls -lt</h4><pre>${esc(ls + more)}</pre></div><div class="tails">${tails || `<span class="muted">没有匹配的输出文件</span>`}</div>`;
+      }
+    }
+  }
+  return `<tr class="detail${j.stale ? " stale" : ""}"><td></td><td colspan="10"><div class="insp">${body}</div></td></tr>`;
+}
+
+async function requestInspect(keys, force){
+  keys = keys.filter(k => force || !requested.has(k));
+  if (!keys.length) return;
+  keys.forEach(k => requested.add(k));
+  try{
+    await fetch("api/inspect", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({keys, force: !!force})});
+  }catch(e){}
+  kick();
+}
+
 // ---------------- 渲染 ----------------
 function renderJobs(){
   const groups = buildGroups(lastData.jobs).filter(groupVisible);
   groupOfJob = {};
-  const rows = [];
+  const rows = [], wantInspect = [];
   let nJobs = 0;
   for (const g of groups){
     nJobs += g.jobs.length;
     g.jobs.forEach(j => groupOfJob[jobKey(j)] = g.key);
     if (g.jobs.length === 1){
-      const j = g.jobs[0];
-      rows.push(`<tr class="one${j.stale ? " stale" : ""}" id="row-${esc(jobKey(j))}"><td class="tog"></td>${jobCells(j, esc(j.name))}</tr>`);
+      // 单个 job 也能展开，看它的工作目录
+      const j = g.jobs[0], open = expanded.has(g.key);
+      rows.push(`<tr class="grp one${open ? " open" : ""}${j.stale ? " stale" : ""}" data-group="${esc(g.key)}" id="row-${esc(jobKey(j))}"><td class="tog"><span class="tri">▶</span></td>${jobCells(j, esc(j.name))}</tr>`);
+      if (open){ rows.push(detailRow(j)); wantInspect.push(jobKey(j)); }
       continue;
     }
     rows.push(groupRow(g));
@@ -358,12 +449,18 @@ function renderJobs(){
       for (const j of g.jobs){
         const isRep = j === g.rep;
         rows.push(`<tr class="child${j.stale ? " stale" : ""}"${isRep ? "" : ` id="row-${esc(jobKey(j))}"`}><td class="tog"></td>${jobCells(j, isRep ? "↳ 当前" : "↳")}</tr>`);
+        rows.push(detailRow(j));
+        wantInspect.push(jobKey(j));
       }
     }
   }
   document.getElementById("jobsBody").innerHTML = rows.join("")
     || `<tr><td colspan="11" class="empty">没有符合条件的 job</td></tr>`;
   document.getElementById("summary").textContent = `${groups.length} 组 · ${nJobs} 个 job`;
+  // 展开着的 job 如果还没读过目录，就请求后台去读（后台会跳过已经读过的）
+  const ins = lastData.inspect || {};
+  const need = wantInspect.filter(k => !ins[k] && !pendingInspect.has(k));
+  if (need.length) requestInspect(need, false);
 }
 
 function renderQos(){
@@ -375,6 +472,7 @@ function renderQos(){
     const authTag = c.need_input ? `<span class="tag auth">需要 2FA</span>` : "";
     const errHtml = c.ok ? "" : `<div class="card-err">${esc(c.error || "error")}</div>`
       + (c.stale_since ? `<div class="stale-note">下面是 ${localTime(c.stale_since)} 的旧数据</div>` : "");
+    if (c.never) return `<div class="card"><div class="card-h"><span class="dot" style="--c:#4a5063"></span>${esc(c.name)}</div><div class="card-err" style="color:var(--muted)">还没拉取过，点"立即刷新"</div></div>`;
     if (!c.ok && !c.stale_since) return `<div class="card"><div class="card-h">${dot}${esc(c.name)}${authTag}</div>${errHtml}</div>`;
     const mr = c.qos.reduce((a, q) => a + q.mine_running, 0), mp = c.qos.reduce((a, q) => a + q.mine_pending, 0);
     const loadTip = c.load_private ? "这个集群的 squeue 只能看到你自己的 job（PrivateData），没法统计全集群" : "所有用户在这个 QoS 上 运行 / 排队 的 job 数";
@@ -398,7 +496,7 @@ function renderQos(){
       </tr>`;
     }).join("");
     return `<div class="card">
-      <div class="card-h">${dot}${esc(c.name)}${authTag}<span class="muted">我的：<span class="n-r">${mr}</span> 运行 · <span class="n-pd">${mp}</span> 排队</span></div>
+      <div class="card-h">${dot}${esc(c.name)}${authTag}<span class="muted">我的：<span class="n-r">${mr}</span> 运行 · <span class="n-pd">${mp}</span> 排队</span><span class="muted at">${c.ok ? localTime(c.at) + " 的数据" : ""}</span></div>
       ${errHtml}
       <table class="qos">
         <thead><tr><th>QoS</th><th>我的</th><th title="${esc(loadTip)}">全集群</th>
@@ -474,8 +572,11 @@ function render(){
   if (!lastData) return;
   jobsByKey = {};
   lastData.jobs.forEach(j => jobsByKey[jobKey(j)] = j);
+  pendingInspect = new Set(lastData.inspect_pending || []);
   renderFilters(); renderErrors(); renderQos(); renderBacklog(); renderJobs();
-  if (lastData.updated_at) document.getElementById("updated").textContent = "更新于 " + new Date(lastData.updated_at).toLocaleTimeString();
+  document.getElementById("updated").textContent = lastData.updated_at
+    ? "数据更新于 " + new Date(lastData.updated_at).toLocaleString([], {month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit"})
+    : "还没刷新过";
 }
 
 function setFilter(k, v){ filters[k] = v; savePref("filters", {...filters, search: ""}); render(); }
@@ -507,6 +608,11 @@ document.getElementById("jobsBody").addEventListener("click", e => {
   if (copy){ copyText(copy.dataset.copy).then(() => toast("已复制 " + copy.dataset.copy)); return; }
   const dep = e.target.closest("[data-jump]");
   if (dep){ jumpTo(dep.dataset.jump); return; }
+  const tg = e.target.closest("[data-insp-toggle]");
+  if (tg){ const k = tg.dataset.inspToggle; detailOpen.has(k) ? detailOpen.delete(k) : detailOpen.add(k); renderJobs(); return; }
+  const rl = e.target.closest("[data-insp-reload]");
+  if (rl){ rl.disabled = true; rl.textContent = "读取中…"; requestInspect([rl.dataset.inspReload], true); return; }
+  if (e.target.closest("tr.detail")) return;
   const grp = e.target.closest("tr.grp");
   if (grp){
     const k = grp.dataset.group;
@@ -531,23 +637,54 @@ document.getElementById("expandAll").addEventListener("click", () => {
 });
 document.getElementById("collapseAll").addEventListener("click", () => { expanded.clear(); savePref("expanded", []); renderJobs(); });
 document.getElementById("refreshBtn").addEventListener("click", async () => {
-  document.getElementById("updated").textContent = "刷新中...";
-  try{ await fetch("api/refresh", {method:"POST"}); }catch(e){}
-  poll();
+  const btn = document.getElementById("refreshBtn");
+  btn.disabled = true; btn.textContent = "已加入队列";
+  try{ await fetch("api/refresh", {method: "POST"}); }catch(e){}
+  kick();
 });
 
-async function poll(){
-  try{
-    const res = await fetch("api/jobs");
-    lastData = await res.json();
-    render();
-  }catch(e){
-    document.getElementById("updated").textContent = "拉取失败: " + e;
-  }
+// ---------------- 和后台同步 ----------------
+// 页面只读本机 Flask 里的结果，不等 SSH：每隔一会儿问一下 /api/status（很轻），
+// 版本号变了才重新拉 /api/jobs。后台忙的时候问得勤一点，好让进度条动起来。
+let version = -1, tickTimer = null, busy = false;
+
+function renderProgress(pr){
+  busy = pr.busy;
+  const bar = document.getElementById("progBar"), wrap = document.getElementById("prog");
+  wrap.classList.toggle("busy", pr.busy);
+  bar.classList.toggle("indet", pr.busy && !pr.total);
+  bar.style.width = pr.busy && pr.total ? Math.max(4, 100 * pr.done / pr.total) + "%" : (pr.busy ? "" : "0");
+  bar.style.marginLeft = "";
+  document.getElementById("progText").textContent = pr.busy
+    ? `后台：${pr.label || "处理中"}${pr.total ? `（${pr.done}/${pr.total} 步）` : ""}${pr.queued ? ` · 还有 ${pr.queued} 个任务` : ""}`
+    : "";
+  const btn = document.getElementById("refreshBtn");
+  btn.disabled = pr.refresh_queued;
+  btn.textContent = pr.refresh_queued ? "刷新中…" : "立即刷新";
 }
 
-poll();
-setInterval(poll, 8000);
+async function loadJobs(){
+  const res = await fetch("api/jobs");
+  lastData = await res.json();
+  version = lastData.version;
+  render();
+  renderProgress(lastData.progress);
+}
+
+async function tick(){
+  clearTimeout(tickTimer);
+  try{
+    const st = await (await fetch("api/status")).json();
+    renderProgress(st.progress);
+    if (st.version !== version) await loadJobs();
+  }catch(e){
+    document.getElementById("progText").textContent = "连不上本机的 dashboard 服务";
+  }
+  tickTimer = setTimeout(tick, busy ? 700 : 3000);
+}
+function kick(){ clearTimeout(tickTimer); tickTimer = setTimeout(tick, 150); }
+
+tick();
 </script>
 </body>
 </html>

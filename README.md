@@ -5,8 +5,12 @@
 
 ## 原理
 
-后台线程按固定间隔（config.yaml 里 `poll_interval_seconds`）对每个集群**一次 SSH**
-跑这几条命令（各集群并行）：
+**网页和 SSH 是解耦的**：所有远程操作都放进一个后台任务队列，一个接一个执行，网页
+上方的进度条显示后台正在干什么。打开网页时直接显示上一次的数据（存在
+`.dashboard_cache.json`，重启 app.py 也还在），不用等 SSH。**默认不自动刷新**，
+点"立即刷新"才去拉；想自动刷新就在 config.yaml 里设 `auto_refresh_minutes`。
+
+每次刷新，对每个集群**一次 SSH**（集群之间依次进行）跑这几条命令：
 - `squeue --me -o ...` 拿当前排队/运行中的作业（含 QoS、依赖、预计开始时间）
 - `sacct -X --starttime=now-Nhours ...` 拿最近 N 小时内已结束的作业
 - `squeue -t RUNNING,PENDING -o '%q|%T'`（所有用户）统计每个 QoS 全集群的运行/排队数
@@ -76,14 +80,20 @@ python app.py
 - 点 Job ID 复制（方便 `scancel` 或者 `--dependency=afterok:ID`）
 - 鼠标停在名字上能看到完整信息（原始 dependency 字符串、提交/开始/结束时间等）
 - 顶部可以按集群 / QoS / 状态筛选、搜索；展开状态和筛选条件会记在浏览器里
-- "立即刷新"按钮会强制马上去 SSH 拉一次最新数据，不用等下一个轮询周期
+- "立即刷新"把一次刷新放进后台队列，马上返回；进度条走完数据就更新了
+- **展开**一组（或单个）job 时，后台会去读每个 job 的工作目录（squeue `%Z` / sacct
+  `WorkDir`）：`ls -lt`，再对 `inspect_files` 里每个模式（默认 `vasp.out`、`Slab*.log`、
+  slurm 输出文件 `*{id}*.out*`）取最新的匹配文件 tail + grep。每个 job 下面会多一行：
+  路径（点击复制）、文件数、vasp.out 的离子步 / F / dE / 电子步、是否收敛、最后一条报错；
+  点"详情"看完整的 `ls -lt` 和 tail。读过的会缓存，点"重新读取"才重新读
 
 ## 常见调整
 
 - **只想看某几个集群**：在 `config.yaml` 里把不需要的集群 `enabled: false` 或删掉。
-- **轮询太慢/太快**：改 `poll_interval_seconds`（SSH 有开销，别设太小，10-20秒合适）。
+- **想自动刷新**：`auto_refresh_minutes: 5`（SSH 有开销，别设太小）。
+- **想多看几个文件**：在 `inspect_files` 里加模式，比如 `OSZICAR`、`slurm-{id}.out`。
 - **依赖链历史看不全**：加大 `history_hours`（sacct 查询范围），但太大会让每次
-  轮询变慢。
+  刷新变慢。
 - **想在手机/同事电脑上也能看**：把 `config.yaml` 里 `host` 改成 `0.0.0.0`，
   然后用你工作电脑的局域网 IP 访问。注意这样局域网内的人都能看到你的作业名字
   等信息，公司网络环境要自己权衡安全性。

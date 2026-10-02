@@ -41,8 +41,21 @@ clusters:
   #   ssh_host: sge-login
   #   enabled: false
 
-# 多久轮询一次所有集群（秒）。SSH 有开销，别设太小；10-20秒比较合适。
-poll_interval_seconds: 15
+# 刷新方式：默认不自动刷新，网页上点"立即刷新"才去 SSH 拉数据。
+# 网页和 SSH 是解耦的：打开网页立刻显示上一次的数据（存在 .dashboard_cache.json），
+# 刷新 / 读目录都在后台按顺序一个个执行，网页上方有进度条。
+# auto_refresh_minutes：>0 就每隔这么多分钟自动刷新一次；0 = 不自动刷新
+auto_refresh_minutes: 0
+# 启动 app.py 时要不要先刷新一次（没有缓存的时候总会刷新一次）
+refresh_on_start: false
+
+# 展开 job 时读取它的工作目录：ls 一下，再对下面每个模式取最新的匹配文件
+# tail 最后几行并解析（VASP 的离子步 / 能量 / 收敛 / 报错）。{id} 会换成 job id。
+inspect_files:
+  - vasp.out
+  - "Slab*.log"
+  - "*{id}*.out*"      # slurm 的输出文件，比如 VASP_GPU-87704.out.txt
+inspect_tail_lines: 30
 
 # sacct 往前查多少小时的历史作业（用来把已经跑完/失败的 job 也显示出来，
 # 这样同名 job / 依赖链里前面已经结束的那些也能看到最终状态）。
@@ -60,7 +73,7 @@ qos_info_refresh_minutes: 30
 backlog: true
 backlog_refresh_minutes: 5
 
-# 集群要求输入 2FA/密码时，多少分钟之后再自动试一次（"立即刷新"会马上重试）。
+# 开了自动刷新时：集群要求输入 2FA/密码后，多少分钟之后再自动试一次（"立即刷新"会马上重试）。
 # 不会发送任何验证码，只是再连一次看看 2FA 是否已经在别处验证过了。
 auth_retry_minutes: 10
 
