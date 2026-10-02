@@ -12,9 +12,15 @@
 - `squeue -t RUNNING,PENDING -o '%q|%T'`（所有用户）统计每个 QoS 全集群的运行/排队数
 - `sacctmgr show assoc / show qos`：你能用哪些 QoS、每个 QoS 的限额
   （这个基本不变，默认 30 分钟才查一次）
+- `squeue --all` + `sinfo`：排队积压估计（逻辑来自 sulis 上用的 godot.py，见 `backlog.py`），
+  比较重，默认 5 分钟才拉一次
 
 **这不是通过 API/REST 连集群，就是普通的 `ssh <host> <command>`**，所以：
-- 需要你本机能免密 SSH 到各集群登录节点（SSH key + agent，或者 key 没设密码）
+- 需要你本机能用 SSH key 登录各集群登录节点（SSH key + agent，或者 key 没设密码）
+- 需要 2FA 的集群（sulis）：2FA 在有效期内就能直接用。程序**不会**替你输验证码——
+  服务器一旦真的弹出输入提示，`ssh_askpass_abort.sh` 会立刻把 ssh 杀掉（什么都不发，
+  不会累积失败次数），网页上显示"需要 2FA"，并且 10 分钟内不再自动重试。
+  这时在终端里 `ssh sulis` 登录一次，再点网页上的"立即刷新"就好
 - 会用到你 `~/.ssh/config` 里已经配置好的 Host 别名、ProxyJump、跳板机等设置
 
 ## 安装 & 运行
@@ -46,6 +52,14 @@ python app.py
 - QoS 列表默认自动查（sacctmgr assoc），也可以在 config.yaml 里每个集群下面写
   `qos:` 手动指定，还能加备注
 
+**排队积压**（每个集群一张卡片）
+- 每个分区：总核数、总卡数、CPU 积压、各型号 GPU 积压。积压 = 把分区里所有 job 的
+  （剩余时长 × 核数/卡数）加起来 ÷ 总核数/卡数，即"完美排满时清空现有的活要多久"
+- 范围 Local – Global：前者只算本分区，后者把共享同一批节点的分区都算上
+- GPU 池：每种卡一共几张，被哪些分区共用
+- 插队：比你在同分区最早排队的 job 晚提交、却已经在跑的别人的 job（通常靠 backfill）
+- 看不到其他用户 job 的集群（bluebear）没法估计，会写一行说明
+
 **Job 表格**
 - 同一个集群里**名字相同**的 job（一般就是一条 dependency 链，或者同一批重复提交）
   收成一行，`×N` 是个数，点 ▶ 展开看每一个。折叠行显示的是"当前"那个 job：
@@ -54,7 +68,11 @@ python app.py
 - 排序：有 job 在跑的组在最上面，然后是排队的，然后是已经结束的
 - "依赖"列显示 `afterok #12345` 这种，前面的小圆点是被依赖 job 的状态颜色，
   点它会跳到那个 job
-- 排队中的 job，"时间"列显示 Slurm 估计的开始时间（`预计`）
+- 排队中的 job，"时间"列显示 Slurm 估计的开始时间（`预计`），以及按积压算的等待范围
+  （`积压`，取瓶颈资源；鼠标停上去看 CPU/GPU 各自的估计）。如果 job 卡在
+  `AssocGrpJobsLimit` / `QOSMaxGRESPerUser` 这类限额上，会显示"卡在限额"——这时是你
+  自己（或同组）的额度满了，跟集群忙不忙没关系
+- 集群暂时连不上时继续显示上一次拉到的数据（变灰），卡片上写着是几点的旧数据
 - 点 Job ID 复制（方便 `scancel` 或者 `--dependency=afterok:ID`）
 - 鼠标停在名字上能看到完整信息（原始 dependency 字符串、提交/开始/结束时间等）
 - 顶部可以按集群 / QoS / 状态筛选、搜索；展开状态和筛选条件会记在浏览器里
@@ -66,15 +84,6 @@ python app.py
 - **轮询太慢/太快**：改 `poll_interval_seconds`（SSH 有开销，别设太小，10-20秒合适）。
 - **依赖链历史看不全**：加大 `history_hours`（sacct 查询范围），但太大会让每次
   轮询变慢。
-- **集群要 2FA / 交互式登录（比如 `Permission denied (keyboard-interactive)`）**：
-  本程序用的是 `ssh -o BatchMode=yes`，不能输密码。可以在 `~/.ssh/config` 里给这个
-  Host 开连接复用，先在终端手动 `ssh` 登录一次，之后 dashboard 会复用这条连接：
-  ```
-  Host sulis
-      ControlMaster auto
-      ControlPath ~/.ssh/cm-%r@%h:%p
-      ControlPersist 12h
-  ```
 - **想在手机/同事电脑上也能看**：把 `config.yaml` 里 `host` 改成 `0.0.0.0`，
   然后用你工作电脑的局域网 IP 访问。注意这样局域网内的人都能看到你的作业名字
   等信息，公司网络环境要自己权衡安全性。

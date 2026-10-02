@@ -81,6 +81,25 @@
   .dep b{font-weight:400;color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;}
   .dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:var(--c);flex:none;}
   .empty{padding:24px;text-align:center;color:var(--muted);}
+  /* 排队积压 */
+  #blGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:12px;margin-bottom:18px;}
+  .bl td{font-variant-numeric:tabular-nums;}
+  .bl tr.mine{background:#1d2436;}
+  .h-ok{color:var(--ok);} .h-mid{color:var(--warn);} .h-bad{color:#ff7b6b;}
+  .gpuv{margin-right:10px;white-space:nowrap;}
+  .gpuv .t{color:var(--muted);font-size:11px;}
+  .card-foot{padding:7px 12px;font-size:12px;color:var(--muted);border-top:1px solid var(--border);}
+  .card-foot b{color:var(--text);font-weight:500;}
+  details.cut{border-top:1px solid var(--border);}
+  details.cut summary{padding:7px 12px;cursor:pointer;font-size:12px;color:var(--warn);}
+  details.cut table td{font-size:12px;}
+  details.how{margin:-2px 0 10px;font-size:12px;color:var(--muted);}
+  details.how summary{cursor:pointer;}
+  details.how div{padding:6px 0 0 14px;line-height:1.6;max-width:900px;}
+  .stale-note{padding:6px 12px;font-size:12px;color:var(--warn);border-bottom:1px solid var(--border);}
+  .tag.auth{background:#4a3b10;color:var(--warn);}
+  #jobs tr.stale td{opacity:.55;}
+  .est{margin-left:6px;font-size:12px;}
   #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--border);padding:6px 14px;border-radius:6px;opacity:0;transition:opacity .2s;pointer-events:none;}
   #toast.show{opacity:1;}
   @media (max-width:640px){
@@ -119,6 +138,17 @@
     <span class="muted">点一行按该 QoS 筛选下面的 job · 我的/全集群 = 运行 / 排队</span></h2>
   <div id="qosGrid"></div>
 
+  <h2>排队积压 <button id="blToggle">收起</button>
+    <span class="muted">每个分区现在的活要多久才能消化完 · 每几分钟更新一次</span></h2>
+  <details class="how"><summary>怎么算的</summary><div>
+    把分区里所有 job 的（剩余时长 × 核数）加起来，除以分区总核数，就是"假设完美排满、把现有的活清空要多久"；GPU 同理按卡算。<br>
+    范围的前一个数（Local）只算这个分区自己；后一个数（Global）把共享同一批节点的分区都算上（比如 gpu / gpulowpri / gpu-devel 共用一批卡）。真实等待一般落在中间。<br>
+    下面 Job 表里你排队的 job 会显示"积压"：取 CPU / GPU 里最慢的那个（瓶颈），多个候选分区取最快的那个。这只是粗略参考：没算优先级、fairshare 和 backfill。<br>
+    "插队"= 和你同分区、比你最早排队的 job 晚提交、却已经在跑的别人的 job，通常是靠 backfill（时间短 / 资源少）插进去的。
+  </div></details>
+  <div id="blGrid"></div>
+  <div id="blNote" class="muted" style="margin:-8px 0 18px"></div>
+
   <h2>Jobs <button id="expandAll">全部展开</button><button id="collapseAll">全部收起</button>
     <span class="muted">同集群、同名字的 job 收在一行里 · 点 Job ID 复制</span></h2>
   <div class="tablewrap">
@@ -154,6 +184,10 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt
 const jobKey = j => j.cluster + ":" + j.id;
 const idNum = j => parseInt(j.id, 10) || 0;
 const fmtTime = s => s ? s.slice(5, 16).replace("T", " ") : "-";
+const fmtH = h => h < 0.1 ? "0h" : h > 48 ? (h / 24).toFixed(1) + "d" : h.toFixed(1) + "h";
+const hCls = h => h < 6 ? "h-ok" : h < 24 ? "h-mid" : "h-bad";
+const fmtRange = (a, b) => `<span class="${hCls(b)}">${Math.abs(b - a) < 0.05 ? fmtH(b) : fmtH(a) + " – " + fmtH(b)}</span>`;
+const localTime = iso => iso ? new Date(iso).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}) : "";
 
 // ---- 本地记住的界面状态（只是个人偏好，丢了也没关系）----
 function loadPref(k, d){ try{ const v = localStorage.getItem("hpcdash." + k); return v === null ? d : JSON.parse(v); }catch(e){ return d; } }
@@ -163,6 +197,7 @@ let expanded = new Set(loadPref("expanded", []));
 let filters = Object.assign({cluster:"", qos:"", state:"", search:""}, loadPref("filters", {}));
 filters.search = "";
 let qosCollapsed = loadPref("qosCollapsed", false);
+let blCollapsed = loadPref("blCollapsed", false);
 let lastData = null;
 let jobsByKey = {};
 let groupOfJob = {};
@@ -230,7 +265,19 @@ function timeUsedCell(j){
 }
 function whenCell(j){
   if (ACTIVE.has(j.state)) return `<span class="muted">开始</span> ${fmtTime(j.start)}`;
-  if (PEND.has(j.state)) return j.start ? `<span class="muted">预计</span> ${fmtTime(j.start)}` : `<span class="muted">提交</span> ${fmtTime(j.submit)}`;
+  if (PEND.has(j.state)){
+    const base = j.start ? `<span class="muted">预计</span> ${fmtTime(j.start)}` : `<span class="muted">提交</span> ${fmtTime(j.submit)}`;
+    // AssocGrpJobsLimit / QOSMaxGRESPerUser 这类：是你自己（或组）的额度满了，不是在等空位
+    if (/^(Assoc|QOS)(Grp|Max)/.test(j.reason || "")){
+      const tip = `卡在限额：${j.reason}\n账户/QoS 的数量或资源上限到顶了，要等你自己（或同组）前面的 job 跑完，积压估计不适用。`;
+      return `${base}<span class="est h-mid" title="${esc(tip)}">卡在限额</span>`;
+    }
+    const w = j.wait_est;
+    if (!w) return base;
+    const tip = `排队积压估计（分区 ${w.partition}）\n` + w.all.map(e => `${e.label}: ${fmtH(e.min)} – ${fmtH(e.max)}`).join("  <  ")
+      + `\n瓶颈: ${w.bottleneck.label}`;
+    return `${base}<span class="est" title="${esc(tip)}"><span class="muted">积压</span> ${fmtRange(w.bottleneck.min, w.bottleneck.max)}</span>`;
+  }
   return `<span class="muted">结束</span> ${fmtTime(j.end)}`;
 }
 function depsCell(j){
@@ -277,7 +324,7 @@ function groupRow(g){
   const j = g.rep;
   const open = expanded.has(g.key);
   const where = g.nRunning > 1 ? `${whereCell(j)} <span class="muted">+${g.nRunning - 1} 个在跑</span>` : whereCell(j);
-  return `<tr class="grp ${open ? "open" : ""}" data-group="${esc(g.key)}" id="row-${esc(jobKey(j))}">
+  return `<tr class="grp ${open ? "open" : ""}${j.stale ? " stale" : ""}" data-group="${esc(g.key)}" id="row-${esc(jobKey(j))}">
     <td class="tog"><span class="tri">▶</span></td>
     <td class="name" title="${esc(g.name)}  (${g.jobs.length} 个 job)">${esc(g.name)}<span class="count">×${g.jobs.length}</span></td>
     <td>${esc(g.cluster)}</td>
@@ -303,14 +350,14 @@ function renderJobs(){
     g.jobs.forEach(j => groupOfJob[jobKey(j)] = g.key);
     if (g.jobs.length === 1){
       const j = g.jobs[0];
-      rows.push(`<tr class="one" id="row-${esc(jobKey(j))}"><td class="tog"></td>${jobCells(j, esc(j.name))}</tr>`);
+      rows.push(`<tr class="one${j.stale ? " stale" : ""}" id="row-${esc(jobKey(j))}"><td class="tog"></td>${jobCells(j, esc(j.name))}</tr>`);
       continue;
     }
     rows.push(groupRow(g));
     if (expanded.has(g.key)){
       for (const j of g.jobs){
         const isRep = j === g.rep;
-        rows.push(`<tr class="child"${isRep ? "" : ` id="row-${esc(jobKey(j))}"`}><td class="tog"></td>${jobCells(j, isRep ? "↳ 当前" : "↳")}</tr>`);
+        rows.push(`<tr class="child${j.stale ? " stale" : ""}"${isRep ? "" : ` id="row-${esc(jobKey(j))}"`}><td class="tog"></td>${jobCells(j, isRep ? "↳ 当前" : "↳")}</tr>`);
       }
     }
   }
@@ -324,8 +371,11 @@ function renderQos(){
   grid.style.display = qosCollapsed ? "none" : "";
   document.getElementById("qosToggle").textContent = qosCollapsed ? "展开" : "收起";
   grid.innerHTML = (lastData.clusters || []).map(c => {
-    const dot = `<span class="dot" style="--c:${c.ok ? "var(--ok)" : "var(--bad)"}"></span>`;
-    if (!c.ok) return `<div class="card"><div class="card-h">${dot}${esc(c.name)}</div><div class="card-err">${esc(c.error || "error")}</div></div>`;
+    const dot = `<span class="dot" style="--c:${c.ok ? "var(--ok)" : c.need_input ? "var(--warn)" : "var(--bad)"}"></span>`;
+    const authTag = c.need_input ? `<span class="tag auth">需要 2FA</span>` : "";
+    const errHtml = c.ok ? "" : `<div class="card-err">${esc(c.error || "error")}</div>`
+      + (c.stale_since ? `<div class="stale-note">下面是 ${localTime(c.stale_since)} 的旧数据</div>` : "");
+    if (!c.ok && !c.stale_since) return `<div class="card"><div class="card-h">${dot}${esc(c.name)}${authTag}</div>${errHtml}</div>`;
     const mr = c.qos.reduce((a, q) => a + q.mine_running, 0), mp = c.qos.reduce((a, q) => a + q.mine_pending, 0);
     const loadTip = c.load_private ? "这个集群的 squeue 只能看到你自己的 job（PrivateData），没法统计全集群" : "所有用户在这个 QoS 上 运行 / 排队 的 job 数";
     const rows = c.qos.map(q => {
@@ -348,7 +398,8 @@ function renderQos(){
       </tr>`;
     }).join("");
     return `<div class="card">
-      <div class="card-h">${dot}${esc(c.name)}<span class="muted">我的：<span class="n-r">${mr}</span> 运行 · <span class="n-pd">${mp}</span> 排队</span></div>
+      <div class="card-h">${dot}${esc(c.name)}${authTag}<span class="muted">我的：<span class="n-r">${mr}</span> 运行 · <span class="n-pd">${mp}</span> 排队</span></div>
+      ${errHtml}
       <table class="qos">
         <thead><tr><th>QoS</th><th>我的</th><th title="${esc(loadTip)}">全集群</th>
           <th title="每人最多同时运行的 job 数 (MaxJobsPU)">MaxJobs</th>
@@ -357,6 +408,44 @@ function renderQos(){
           <th title="每人资源上限 (MaxTRESPU)">MaxTRES/人</th></tr></thead>
         <tbody>${rows || `<tr><td colspan="7" class="empty">没查到 QoS（可以在 config.yaml 里手动写）</td></tr>`}</tbody>
       </table></div>`;
+  }).join("");
+}
+
+function renderBacklog(){
+  const grid = document.getElementById("blGrid");
+  grid.style.display = blCollapsed ? "none" : "";
+  document.getElementById("blToggle").textContent = blCollapsed ? "展开" : "收起";
+  const all = (lastData.clusters || []).filter(c => c.backlog);
+  // 估计不了的集群（比如看不到别人的 job）只写一行说明，不占一整张卡片
+  document.getElementById("blNote").innerHTML = all.filter(c => !c.backlog.ok)
+    .map(c => `<div>${esc(c.name)}：${esc(c.backlog.error || "没法估计")}</div>`).join("");
+  document.getElementById("blNote").style.display = blCollapsed ? "none" : "";
+  grid.innerHTML = all.filter(c => c.backlog.ok).map(c => {
+    const b = c.backlog;
+    const head = `<div class="card-h"><span class="dot" style="--c:${b.ok ? "var(--ok)" : "#4a5063"}"></span>${esc(c.name)}`
+      + `<span class="muted">${b.fetched_at ? localTime(b.fetched_at) + " 的数据" : ""}${c.stale_since ? "（集群现在连不上）" : ""}</span></div>`;
+    const rows = b.partitions.map(p => {
+      const gpu = p.gpu.length ? p.gpu.map(g => `<span class="gpuv"><span class="t">${esc(g.type)}</span> ${fmtRange(g.min, g.max)}</span>`).join("") : `<span class="n-0">—</span>`;
+      const mine = p.mine_running || p.mine_pending;
+      return `<tr class="${mine ? "mine" : ""}">
+        <td>${esc(p.name)}</td>
+        <td class="lim">${p.cpus}</td>
+        <td class="lim">${p.gpus || "-"}</td>
+        <td>${fmtRange(p.cpu_min, p.cpu_max)}</td>
+        <td>${gpu}</td>
+        <td>${mine ? `<span class="${p.mine_running ? "n-r" : "n-0"}">${p.mine_running}</span> / <span class="${p.mine_pending ? "n-pd" : "n-0"}">${p.mine_pending}</span>` : `<span class="n-0">—</span>`}</td>
+      </tr>`;
+    }).join("");
+    const pools = b.pools.length ? `<div class="card-foot">GPU 池：` + b.pools.map(pl =>
+      `<b>${esc(pl.type)}</b> ${pl.cards} 卡（${esc(pl.partitions.join(", "))} 共用）`).join(" · ") + `</div>` : "";
+    const cut = b.cutters_total ? `<details class="cut"><summary>插队：${b.cutters_total} 个比你晚提交的 job 已经在跑${b.cutters_total > b.cutters.length ? `（显示最新 ${b.cutters.length} 个）` : ""}</summary>
+      <table><thead><tr><th>Job ID</th><th>分区</th><th>账户</th><th>资源</th><th>申请时长</th><th>推测原因</th></tr></thead><tbody>`
+      + b.cutters.map(x => `<tr><td>${esc(x.id)}</td><td>${esc(x.partition)}</td><td>${esc(x.account)}</td><td>${x.cpus}C/${x.gpus}G</td><td>${esc(x.limit)}</td><td>${esc(x.reason)}</td></tr>`).join("")
+      + `</tbody></table></details>` : "";
+    return `<div class="card">${head}
+      <table class="bl"><thead><tr><th>分区</th><th>总核数</th><th>总卡数</th>
+        <th title="Local（只算本分区） – Global（算上共享节点的分区）">CPU 积压</th><th>GPU 积压</th><th>我的</th></tr></thead>
+      <tbody>${rows}</tbody></table>${pools}${cut}</div>`;
   }).join("");
 }
 
@@ -385,7 +474,7 @@ function render(){
   if (!lastData) return;
   jobsByKey = {};
   lastData.jobs.forEach(j => jobsByKey[jobKey(j)] = j);
-  renderFilters(); renderErrors(); renderQos(); renderJobs();
+  renderFilters(); renderErrors(); renderQos(); renderBacklog(); renderJobs();
   if (lastData.updated_at) document.getElementById("updated").textContent = "更新于 " + new Date(lastData.updated_at).toLocaleTimeString();
 }
 
@@ -435,6 +524,7 @@ document.getElementById("qosFilter").addEventListener("change", e => setFilter("
 document.getElementById("stateFilter").addEventListener("change", e => setFilter("state", e.target.value));
 document.getElementById("searchBox").addEventListener("input", e => { filters.search = e.target.value.trim(); renderJobs(); });
 document.getElementById("qosToggle").addEventListener("click", () => { qosCollapsed = !qosCollapsed; savePref("qosCollapsed", qosCollapsed); renderQos(); });
+document.getElementById("blToggle").addEventListener("click", () => { blCollapsed = !blCollapsed; savePref("blCollapsed", blCollapsed); renderBacklog(); });
 document.getElementById("expandAll").addEventListener("click", () => {
   buildGroups(lastData.jobs).filter(groupVisible).forEach(g => { if (g.jobs.length > 1) expanded.add(g.key); });
   savePref("expanded", [...expanded]); renderJobs();

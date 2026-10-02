@@ -13,10 +13,12 @@ HPC Job Dashboard
     python app.py
     浏览器打开 http://127.0.0.1:8787 (端口见 config.yaml)
 
-依赖：本机能免密 ssh 到各集群登录节点（ssh key / agent），不处理交互式密码。
+依赖：本机能用 ssh key 登录各集群。需要 2FA 的集群（比如 sulis）在 2FA 还在
+有效期内时也能用；过期了会显示"需要输入"，在终端里手动 ssh 登录一次再点"立即刷新"。
 """
 
 import json
+import os
 import re
 import subprocess
 import threading
@@ -27,7 +29,10 @@ from datetime import datetime, timezone
 import yaml
 from flask import Flask, jsonify, render_template
 
+import backlog
+
 CONFIG_PATH = "config.yaml"
+ASKPASS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ssh_askpass_abort.sh")
 
 SQUEUE_FIELDS = [
     "jobid",
@@ -42,9 +47,11 @@ SQUEUE_FIELDS = [
     "qos",
     "submit",
     "start",
+    "cpus",
+    "tres",
     "dependency",
 ]
-SQUEUE_FORMAT = "%i|%P|%j|%u|%T|%M|%l|%D|%R|%q|%V|%S|%E"
+SQUEUE_FORMAT = "%i|%P|%j|%u|%T|%M|%l|%D|%R|%q|%V|%S|%C|%b|%E"
 
 SACCT_FIELDS = [
     "jobid",
@@ -85,45 +92,49 @@ def load_config():
         return yaml.safe_load(f)
 
 
+class NeedInput(Exception):
+    """服务器要求交互输入（2FA 验证码 / 密码 / 确认 host key）"""
+
+
 def run_ssh(ssh_host, remote_cmd, timeout):
     """跑一条远程命令，返回 (ok, stdout, stderr)。
     ok 只表示 SSH 本身连上了（返回码 255 是 ssh 自己的错误），
-    远程各条命令成功与否由 split_sections 里的 @@ERR 标记判断。"""
+    远程各条命令成功与否由 split_sections 里的 @@ERR 标记判断。
+
+    不用 BatchMode=yes：它会直接拒绝 keyboard-interactive 认证，而 sulis 这种
+    "key + 2FA" 的集群，即使 2FA 还在有效期（不用输验证码），也要走一轮
+    keyboard-interactive。这里允许它，但一旦服务器真的要输入东西，
+    ssh_askpass_abort.sh 会直接杀掉 ssh（不发任何回答），抛 NeedInput。
+    start_new_session 让 ssh 没有控制终端，不会在你跑 app.py 的终端里弹提示。"""
+    env = dict(os.environ, SSH_ASKPASS=ASKPASS, SSH_ASKPASS_REQUIRE="force")
+    env.setdefault("DISPLAY", "none")  # 老版本 OpenSSH 只有设了 DISPLAY 才会用 SSH_ASKPASS
     try:
         proc = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", ssh_host, remote_cmd],
+            ["ssh", "-o", "BatchMode=no", "-o", "KbdInteractiveAuthentication=yes",
+             "-o", "ConnectTimeout=10", ssh_host, remote_cmd],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
+            start_new_session=True,
         )
-        if proc.returncode == 255:
-            return False, "", proc.stderr.strip()
-        return True, proc.stdout, proc.stderr.strip()
     except subprocess.TimeoutExpired:
         return False, "", "ssh timeout"
     except Exception as e:  # noqa: BLE001
         return False, "", str(e)
+    m = re.search(r"@@NEED_INPUT (.*)", proc.stderr)
+    if m:
+        raise NeedInput(m.group(1).strip() or "(prompt)")
+    if proc.returncode == 255 or proc.returncode < 0:
+        return False, "", proc.stderr.strip()[-300:]
+    return True, proc.stdout, proc.stderr.strip()
 
 
-def build_remote_cmd(hours, with_load, with_qos_info):
+def build_remote_cmd(steps):
     """把所有要跑的命令拼成一次 SSH，用 @@SECTION 标记分段（省掉多次 SSH 握手）。
     某条命令失败时输出 @@ERR <section>，不影响其它段。"""
-    steps = [
-        ("SQUEUE", f"squeue --me -h -o '{SQUEUE_FORMAT}'"),
-        (
-            "SACCT",
-            f"sacct -X --starttime=now-{hours}hours -o {SACCT_FORMAT} --parsable2 --noheader",
-        ),
-    ]
-    if with_load:
-        # 全集群（所有用户）每个 QoS 的 running/pending 数，用来判断哪里比较空
-        steps.append(("LOAD", "squeue -h -t RUNNING,PENDING -o '%q|%T' | sort | uniq -c"))
-    if with_qos_info:
-        steps.append(("ASSOC", "sacctmgr -nP show assoc user=$USER format=qos"))
-        steps.append(("QOS", f"sacctmgr -nP show qos format={QOS_LIMIT_FORMAT}"))
-    parts = []
-    for name, cmd in steps:
-        parts.append(f"echo @@{name}; {cmd} || echo '@@ERR {name}'")
+    parts = [f"echo @@{name}; {cmd} || echo '@@ERR {name}'" for name, cmd in steps]
     parts.append("echo @@END")
     return "; ".join(parts)
 
@@ -193,6 +204,8 @@ def parse_squeue(lines, cluster_name):
             "submit": clean_time(rec["submit"]),
             "start": clean_time(rec["start"]),  # PENDING 时是 Slurm 预计的开始时间
             "end": "",
+            "cpus": rec["cpus"],
+            "tres": rec["tres"] if rec["tres"] not in ("N/A", "(null)") else "",
             "dependency_raw": rec["dependency"] if rec["dependency"] != "(null)" else "",
             "deps": parse_dependency(rec["dependency"]),
             "source": "squeue",
@@ -290,21 +303,61 @@ class Poller:
         self.state = {"jobs": [], "clusters": [], "updated_at": None, "errors": []}
         # sacctmgr 的 QoS 信息基本不变，缓存起来，不用每轮都查
         self.qos_info = {}  # cluster name -> {"assoc": [...], "limits": {...}, "fetched_at": t}
+        # 排队积压要拉全集群的 squeue，比较重，隔几分钟才拉一次
+        self.backlog = {}  # cluster name -> {"result": {...}, "model": {...}, "fetched_at": t}
+        # 需要 2FA 的集群：先停一阵子不自动重试（"立即刷新"会强制重试）
+        self.auth_blocked = {}  # cluster name -> {"until": t, "error": str}
+        self.last_good = {}  # cluster name -> 上一次成功的结果（连不上时继续显示，标成旧数据）
         self._stop = False
 
-    def poll_cluster(self, c):
+    def poll_cluster(self, c, force=False):
         cfg = self.config
         name = c["name"]
+        now = time.time()
+        blocked = self.auth_blocked.get(name)
+        if blocked and not force and now < blocked["until"]:
+            retry = datetime.fromtimestamp(blocked["until"]).strftime("%H:%M")
+            return {"name": name, "ok": False, "need_input": True,
+                    "error": f"{blocked['error']}（{retry} 自动重试，或登录后点立即刷新）",
+                    "warnings": [], "jobs": {}, "qos": []}
+
         timeout = cfg.get("ssh_timeout_seconds", 15)
         hours = cfg.get("history_hours", 48)
         with_load = cfg.get("show_cluster_load", True)
         refresh_s = cfg.get("qos_info_refresh_minutes", 30) * 60
         cached = self.qos_info.get(name)
-        with_qos_info = cached is None or time.time() - cached["fetched_at"] > refresh_s
-
-        ok, out, err = run_ssh(
-            c["ssh_host"], build_remote_cmd(hours, with_load, with_qos_info), timeout
+        with_qos_info = cached is None or now - cached["fetched_at"] > refresh_s
+        bl_cached = self.backlog.get(name)
+        with_backlog = c.get("backlog", cfg.get("backlog", True)) and (
+            bl_cached is None
+            or now - bl_cached["fetched_at"] > cfg.get("backlog_refresh_minutes", 5) * 60
         )
+
+        steps = [
+            ("SQUEUE", f"squeue --me -h -o '{SQUEUE_FORMAT}'"),
+            ("SACCT", f"sacct -X --starttime=now-{hours}hours -o {SACCT_FORMAT} "
+                      f"--parsable2 --noheader"),
+        ]
+        if with_load:
+            # 全集群（所有用户）每个 QoS 的 running/pending 数，用来判断哪里比较空
+            steps.append(("LOAD", "squeue -h -t RUNNING,PENDING -o '%q|%T' | sort | uniq -c"))
+        if with_qos_info:
+            steps.append(("ASSOC", "sacctmgr -nP show assoc user=$USER format=qos"))
+            steps.append(("QOS", f"sacctmgr -nP show qos format={QOS_LIMIT_FORMAT}"))
+        if with_backlog:
+            steps.append(("ME", "id -un"))
+            steps.extend(backlog.COMMANDS)
+
+        timeout_total = timeout * (2 if with_backlog else 1)
+        try:
+            ok, out, err = run_ssh(c["ssh_host"], build_remote_cmd(steps), timeout_total)
+        except NeedInput as e:
+            msg = f"需要交互输入（2FA/密码）：{e}。请先在终端里手动 ssh {c['ssh_host']} 登录一次"
+            self.auth_blocked[name] = {
+                "until": now + cfg.get("auth_retry_minutes", 10) * 60, "error": msg}
+            return {"name": name, "ok": False, "need_input": True, "error": msg,
+                    "warnings": [], "jobs": {}, "qos": []}
+        self.auth_blocked.pop(name, None)
         if not ok:
             return {"name": name, "ok": False, "error": err or "ssh failed", "warnings": [],
                     "jobs": {}, "qos": []}
@@ -315,7 +368,8 @@ class Poller:
             return {"name": name, "ok": False, "error": err[-300:] or "squeue/sacct 都失败了",
                     "warnings": [], "jobs": {}, "qos": []}
         for sec in sorted(failed):
-            warnings.append(f"{sec.lower()} 命令失败")
+            if not sec.startswith("BL_"):  # 积压分析失败会在积压面板里说明，这里不重复报
+                warnings.append(f"{sec.lower()} 命令失败")
 
         hist = parse_sacct(sections.get("SACCT", []), name)
         active = parse_squeue(sections.get("SQUEUE", []), name)
@@ -343,8 +397,23 @@ class Poller:
         if load_private:
             load, with_load = {}, False
 
+        if with_backlog:
+            me = (sections.get("ME") or [""])[0]
+            try:
+                result, model = backlog.analyze(sections, me)
+            except Exception as e:  # noqa: BLE001
+                result, model = {"ok": False, "error": f"积压分析出错: {e}"}, None
+            result["fetched_at"] = datetime.now(timezone.utc).isoformat()
+            bl_cached = {"result": result, "model": model, "fetched_at": now}
+            self.backlog[name] = bl_cached
+        if bl_cached:
+            for j in jobs.values():
+                if j["state"] in PENDING and j["source"] == "squeue":
+                    j["wait_est"] = backlog.estimate_job(j, bl_cached["model"])
+
         return {"name": name, "ok": True, "error": None, "warnings": warnings,
                 "load_private": load_private,
+                "backlog": bl_cached["result"] if bl_cached else None,
                 "jobs": jobs, "qos": self.build_qos_table(c, jobs, cached, load, with_load)}
 
     @staticmethod
@@ -381,21 +450,33 @@ class Poller:
             })
         return table
 
-    def poll_once(self):
+    def poll_once(self, force=False):
         with self.poll_lock:
             clusters = [c for c in self.config.get("clusters", []) if c.get("enabled", True)]
             with ThreadPoolExecutor(max_workers=max(1, len(clusters))) as ex:
-                results = list(ex.map(self.poll_cluster, clusters))
+                results = list(ex.map(lambda c: self.poll_cluster(c, force), clusters))
 
             all_jobs, errors, cluster_status = [], [], []
             for r in results:
-                if not r["ok"]:
+                stale_since = None
+                if r["ok"]:
+                    r["at"] = datetime.now(timezone.utc).isoformat()
+                    self.last_good[r["name"]] = r
+                else:
                     errors.append(f"{r['name']}: {r['error']}")
+                    prev = self.last_good.get(r["name"])
+                    if prev:  # 连不上时继续显示上一次的数据，前端标成旧数据
+                        r = {**prev, "ok": False, "error": r["error"],
+                             "need_input": r.get("need_input", False), "warnings": []}
+                        stale_since = prev["at"]
                 errors.extend(f"{r['name']}: {w}" for w in r["warnings"])
-                all_jobs.extend(r["jobs"].values())
+                for j in r["jobs"].values():
+                    all_jobs.append({**j, "stale": bool(stale_since)})
                 cluster_status.append({
                     "name": r["name"], "ok": r["ok"], "error": r["error"],
+                    "need_input": r.get("need_input", False), "stale_since": stale_since,
                     "load_private": r.get("load_private", False), "qos": r["qos"],
+                    "backlog": r.get("backlog"),
                 })
 
             with self.lock:
@@ -443,7 +524,7 @@ def api_jobs():
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
     """手动触发一次立即刷新（不等下一个轮询周期）"""
-    poller.poll_once()
+    poller.poll_once(force=True)
     return jsonify({"ok": True})
 
 
