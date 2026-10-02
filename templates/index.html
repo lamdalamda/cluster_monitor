@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HPC Job Dashboard</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#161922; --panel2:#1b1f2a; --border:#2a2e3a; --text:#e6e8ee; --muted:#8b90a0;
+    --accent:#5b8def; --row-hover:#1e2330; --child:#12151d;
+    --ok:#2ecc71; --warn:#f1c40f; --bad:#e74c3c;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);font-size:13px;}
+  header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--panel);flex-wrap:wrap;}
+  header h1{font-size:15px;margin:0 6px 0 0;font-weight:600;}
+  .muted{color:var(--muted);font-size:12px;}
+  .spacer{flex:1;}
+  select,input[type=text]{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 9px;font-size:13px;}
+  input[type=text]{width:220px;}
+  button{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 11px;font-size:13px;cursor:pointer;}
+  button:hover{border-color:var(--accent);}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;}
+  main{padding:14px 16px 40px;}
+  h2{font-size:13px;font-weight:600;margin:0 0 8px;color:var(--muted);display:flex;align-items:center;gap:8px;}
+  h2 button{font-size:11px;padding:1px 8px;}
+  h2 .muted{font-weight:400;}
+  .errbox{background:#3a1f1f;border:1px solid #6b2b2b;color:#ff9d9d;padding:7px 10px;border-radius:6px;margin-bottom:12px;font-size:12px;}
+  .errbox div{word-break:break-all;}
+
+  /* QoS 面板 */
+  #qosGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:12px;margin-bottom:18px;}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow-x:auto;}
+  .card-h{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);font-weight:600;}
+  .card-h .muted{font-weight:400;}
+  .card-err{padding:10px 12px;color:#ff9d9d;font-size:12px;word-break:break-all;}
+  table{border-collapse:collapse;width:100%;}
+  th{font-weight:500;color:var(--muted);text-align:left;font-size:12px;padding:6px 10px;border-bottom:1px solid var(--border);white-space:nowrap;background:var(--panel);}
+  td{padding:5px 10px;border-bottom:1px solid var(--border);white-space:nowrap;vertical-align:middle;}
+  .qos td{font-variant-numeric:tabular-nums;}
+  .qos tbody tr{cursor:pointer;}
+  .qos tbody tr:hover{background:var(--row-hover);}
+  .qos tr.sel{background:#22304d;}
+  .qos tr.idle td.qname{color:var(--muted);}
+  .qos .note{display:block;color:var(--muted);font-size:11px;white-space:normal;}
+  .qos .lim{color:var(--muted);}
+  .qos .tres{white-space:normal;word-break:break-all;min-width:110px;font-size:12px;}
+  .qos tr.full td.mine{color:var(--warn);}
+  .qos tr.subfull td.mine{color:var(--bad);}
+  .n-r{color:var(--ok);} .n-pd{color:var(--warn);} .n-0{color:#4a5063;}
+  .tag{display:inline-block;font-size:10px;padding:0 5px;border-radius:3px;margin-left:5px;vertical-align:1px;}
+  .tag.full{background:#4a3b10;color:var(--warn);} .tag.subfull{background:#4a1c1c;color:#ff9d9d;}
+  .tag.cfg{background:#1f2c48;color:#9db8f5;}
+
+  /* Job 表格 */
+  .tablewrap{background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow-x:auto;}
+  #jobs th{position:sticky;top:0;}
+  #jobs tbody tr.grp:hover, #jobs tbody tr.one:hover{background:var(--row-hover);}
+  #jobs tr.child{background:var(--child);}
+  #jobs tr.child td{border-bottom-color:#1d212b;}
+  #jobs tr.child td.name{padding-left:28px;color:var(--muted);}
+  #jobs tr.flash{animation:flash 1.6s ease-out;}
+  @keyframes flash{0%{background:#2c4a80;}100%{background:transparent;}}
+  td.tog{width:26px;padding:0 0 0 10px;color:var(--muted);cursor:pointer;user-select:none;}
+  tr.grp td{cursor:pointer;}
+  .tri{display:inline-block;transition:transform .12s;font-size:10px;}
+  .open .tri{transform:rotate(90deg);}
+  td.name{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;max-width:420px;overflow:hidden;text-overflow:ellipsis;}
+  .count{color:var(--muted);font-family:inherit;font-size:11px;margin-left:6px;}
+  td.jid{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;cursor:copy;}
+  td.jid:hover{color:var(--accent);}
+  td.part{max-width:180px;overflow:hidden;text-overflow:ellipsis;color:var(--muted);}
+  td.where{max-width:260px;overflow:hidden;text-overflow:ellipsis;}
+  td.num{font-variant-numeric:tabular-nums;}
+  .st{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600;color:#111;background:var(--c);}
+  .st.light{color:#fff;}
+  .cnts{margin-left:6px;}
+  .cnt{display:inline-block;font-size:10px;padding:0 5px;margin-right:3px;border-radius:3px;border:1px solid var(--c);color:var(--c);font-variant-numeric:tabular-nums;}
+  .dep{display:inline-flex;align-items:center;gap:4px;margin-right:8px;cursor:pointer;color:var(--muted);}
+  .dep:hover{color:var(--accent);}
+  .dep b{font-weight:400;color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:var(--c);flex:none;}
+  .empty{padding:24px;text-align:center;color:var(--muted);}
+  #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--border);padding:6px 14px;border-radius:6px;opacity:0;transition:opacity .2s;pointer-events:none;}
+  #toast.show{opacity:1;}
+  @media (max-width:640px){
+    header{padding:8px 16px;} main{padding:12px 16px 40px;}
+    input[type=text]{width:100%;}
+    #qosGrid{grid-template-columns:1fr;}
+    .card{overflow-x:auto;}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>HPC Job Dashboard</h1>
+  <span class="muted" id="updated">未更新</span>
+  <select id="clusterFilter" title="集群"><option value="">所有集群</option></select>
+  <select id="qosFilter" title="QoS"><option value="">所有 QoS</option></select>
+  <select id="stateFilter" title="状态">
+    <option value="">全部状态</option>
+    <option value="active">活跃（运行+排队）</option>
+    <option value="running">运行中</option>
+    <option value="pending">排队中</option>
+    <option value="done">已结束</option>
+    <option value="failed">最近一个失败/取消</option>
+  </select>
+  <input type="text" id="searchBox" placeholder="搜索 job id / 名字 / 节点 / QoS">
+  <span class="spacer"></span>
+  <span class="muted" id="summary"></span>
+  <button id="refreshBtn" class="primary">立即刷新</button>
+</header>
+
+<main>
+  <div id="errors"></div>
+
+  <h2>QoS <button id="qosToggle">收起</button>
+    <span class="muted">点一行按该 QoS 筛选下面的 job · 我的/全集群 = 运行 / 排队</span></h2>
+  <div id="qosGrid"></div>
+
+  <h2>Jobs <button id="expandAll">全部展开</button><button id="collapseAll">全部收起</button>
+    <span class="muted">同集群、同名字的 job 收在一行里 · 点 Job ID 复制</span></h2>
+  <div class="tablewrap">
+    <table id="jobs">
+      <thead><tr>
+        <th></th><th>名字</th><th>集群</th><th>Job ID</th><th>状态</th><th>QoS</th><th>分区</th>
+        <th>节点 / 原因</th><th>用时 / 限时</th><th>时间</th><th>依赖</th>
+      </tr></thead>
+      <tbody id="jobsBody"><tr><td colspan="11" class="empty">加载中…</td></tr></tbody>
+    </table>
+  </div>
+</main>
+<div id="toast"></div>
+
+<script>
+const STATE_COLOR = {
+  RUNNING:"#2ecc71", COMPLETING:"#27ae60", CONFIGURING:"#27ae60",
+  PENDING:"#f1c40f", SUSPENDED:"#9b59b6", REQUEUED:"#f39c12", REQUEUE_HOLD:"#f39c12",
+  COMPLETED:"#6b7385", CANCELLED:"#e67e22", FAILED:"#e74c3c", TIMEOUT:"#c0392b",
+  NODE_FAIL:"#c0392b", OUT_OF_MEMORY:"#c0392b", PREEMPTED:"#c0392b", BOOT_FAIL:"#c0392b", DEADLINE:"#c0392b",
+};
+const SHORT = {RUNNING:"R",COMPLETING:"CG",CONFIGURING:"CF",PENDING:"PD",SUSPENDED:"S",REQUEUED:"RQ",
+  COMPLETED:"CD",CANCELLED:"CA",FAILED:"F",TIMEOUT:"TO",NODE_FAIL:"NF",OUT_OF_MEMORY:"OOM",PREEMPTED:"PR"};
+const ORDER = ["RUNNING","COMPLETING","CONFIGURING","PENDING","SUSPENDED","REQUEUED","COMPLETED",
+  "FAILED","TIMEOUT","OUT_OF_MEMORY","NODE_FAIL","PREEMPTED","CANCELLED"];
+const ACTIVE = new Set(["RUNNING","COMPLETING","CONFIGURING"]);
+const PEND = new Set(["PENDING","SUSPENDED","REQUEUED","REQUEUE_HOLD","RESV_DEL_HOLD"]);
+const BAD = new Set(["FAILED","CANCELLED","TIMEOUT","NODE_FAIL","OUT_OF_MEMORY","PREEMPTED","BOOT_FAIL","DEADLINE"]);
+const LIGHT_TEXT = new Set(["COMPLETED","FAILED","TIMEOUT","NODE_FAIL","OUT_OF_MEMORY","PREEMPTED","BOOT_FAIL","DEADLINE","SUSPENDED"]);
+
+const colorFor = s => STATE_COLOR[s] || "#3498db";
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const jobKey = j => j.cluster + ":" + j.id;
+const idNum = j => parseInt(j.id, 10) || 0;
+const fmtTime = s => s ? s.slice(5, 16).replace("T", " ") : "-";
+
+// ---- 本地记住的界面状态（只是个人偏好，丢了也没关系）----
+function loadPref(k, d){ try{ const v = localStorage.getItem("hpcdash." + k); return v === null ? d : JSON.parse(v); }catch(e){ return d; } }
+function savePref(k, v){ try{ localStorage.setItem("hpcdash." + k, JSON.stringify(v)); }catch(e){} }
+
+let expanded = new Set(loadPref("expanded", []));
+let filters = Object.assign({cluster:"", qos:"", state:"", search:""}, loadPref("filters", {}));
+filters.search = "";
+let qosCollapsed = loadPref("qosCollapsed", false);
+let lastData = null;
+let jobsByKey = {};
+let groupOfJob = {};
+
+function stBadge(s){
+  return `<span class="st ${LIGHT_TEXT.has(s) ? "light" : ""}" style="--c:${colorFor(s)}">${esc(s)}</span>`;
+}
+
+// ---------------- 分组 ----------------
+function buildGroups(jobs){
+  const map = new Map();
+  for (const j of jobs){
+    const k = j.cluster + "\u0000" + j.name;
+    if (!map.has(k)) map.set(k, {key:k, cluster:j.cluster, name:j.name, jobs:[]});
+    map.get(k).jobs.push(j);
+  }
+  const groups = [...map.values()];
+  for (const g of groups){
+    g.jobs.sort((a, b) => idNum(a) - idNum(b) || a.id.localeCompare(b.id));
+    // 代表这一组的 job：正在跑的 > 下一个排队的 > 最后一个
+    g.rep = g.jobs.find(j => ACTIVE.has(j.state)) || g.jobs.find(j => PEND.has(j.state)) || g.jobs[g.jobs.length - 1];
+    g.rank = ACTIVE.has(g.rep.state) ? 0 : PEND.has(g.rep.state) ? 1 : 2;
+    g.maxId = Math.max(...g.jobs.map(idNum));
+    g.counts = {};
+    for (const j of g.jobs) g.counts[j.state] = (g.counts[j.state] || 0) + 1;
+    g.qosList = [...new Set(g.jobs.map(j => j.qos).filter(Boolean))];
+    g.nRunning = g.jobs.filter(j => ACTIVE.has(j.state)).length;
+  }
+  groups.sort((a, b) => a.rank - b.rank || a.cluster.localeCompare(b.cluster) || b.maxId - a.maxId);
+  return groups;
+}
+
+function groupVisible(g){
+  if (filters.cluster && g.cluster !== filters.cluster) return false;
+  if (filters.qos){
+    const [c, q] = filters.qos.split("|");
+    if (g.cluster !== c || !g.jobs.some(j => j.qos === q)) return false;
+  }
+  const s = g.rep.state;
+  switch (filters.state){
+    case "active":  if (g.rank > 1) return false; break;
+    case "running": if (g.rank !== 0) return false; break;
+    case "pending": if (!g.jobs.some(j => PEND.has(j.state))) return false; break;
+    case "done":    if (g.rank !== 2) return false; break;
+    case "failed":  if (g.rank !== 2 || !BAD.has(s)) return false; break;
+  }
+  if (filters.search){
+    const q = filters.search.toLowerCase();
+    const hit = g.jobs.some(j => [j.id, j.name, j.nodelist, j.qos, j.partition, j.cluster].join(" ").toLowerCase().includes(q));
+    if (!hit) return false;
+  }
+  return true;
+}
+
+// ---------------- 单元格 ----------------
+function whereCell(j){
+  if (ACTIVE.has(j.state)) return esc(j.nodelist || "-");
+  if (PEND.has(j.state)) return `<span class="muted">${esc(j.reason || "-")}</span>`;
+  return `<span class="muted">${esc(j.nodelist || "")}</span>`;
+}
+function timeUsedCell(j){
+  if (ACTIVE.has(j.state)) return `${esc(j.time_used)} <span class="muted">/ ${esc(j.time_limit || "-")}</span>`;
+  if (PEND.has(j.state)) return `<span class="muted">— / ${esc(j.time_limit || "-")}</span>`;
+  return esc(j.time_used || "-");
+}
+function whenCell(j){
+  if (ACTIVE.has(j.state)) return `<span class="muted">开始</span> ${fmtTime(j.start)}`;
+  if (PEND.has(j.state)) return j.start ? `<span class="muted">预计</span> ${fmtTime(j.start)}` : `<span class="muted">提交</span> ${fmtTime(j.submit)}`;
+  return `<span class="muted">结束</span> ${fmtTime(j.end)}`;
+}
+function depsCell(j){
+  if (!j.deps || !j.deps.length) return "";
+  return j.deps.map(d => {
+    if (!d.id) return `<span class="dep">${esc(d.type)}</span>`;
+    const target = jobsByKey[j.cluster + ":" + d.id];
+    const st = target ? target.state : "UNKNOWN";
+    const sameName = target && target.name === j.name;
+    const label = target ? (sameName ? "" : " " + target.name) : " (不在历史窗口内)";
+    const tip = `${d.type}:${d.id}${d.status ? " (" + d.status + ")" : ""} → ${st}${target ? " " + target.name : ""}`;
+    return `<span class="dep" data-jump="${esc(j.cluster + ":" + d.id)}" title="${esc(tip)}">`
+      + `<span class="dot" style="--c:${colorFor(st)}"></span>${esc(d.type)} <b>#${esc(d.id)}</b>${esc(label)}</span>`;
+  }).join("");
+}
+function jobTip(j){
+  return [
+    `#${j.id}  ${j.name}`, `状态: ${j.state}`, `QoS: ${j.qos || "-"}  分区: ${j.partition || "-"}`,
+    `节点: ${j.nodelist || "-"}`, j.reason ? `原因: ${j.reason}` : "",
+    `提交: ${j.submit || "-"}`, `开始: ${j.start || "-"}`, `结束: ${j.end || "-"}`,
+    j.dependency_raw ? `依赖: ${j.dependency_raw}` : "", `来源: ${j.source}`,
+  ].filter(Boolean).join("\n");
+}
+
+function jobCells(j, nameHtml){
+  return `<td class="name" title="${esc(jobTip(j))}">${nameHtml}</td>
+    <td>${esc(j.cluster)}</td>
+    <td class="jid" data-copy="${esc(j.id)}" title="点击复制">${esc(j.id)}</td>
+    <td>${stBadge(j.state)}</td>
+    <td>${esc(j.qos || "-")}</td>
+    <td class="part" title="${esc(j.partition)}">${esc(j.partition || "-")}</td>
+    <td class="where" title="${esc(j.nodelist || j.reason)}">${whereCell(j)}</td>
+    <td class="num">${timeUsedCell(j)}</td>
+    <td class="num">${whenCell(j)}</td>
+    <td>${depsCell(j)}</td>`;
+}
+
+function countPills(g){
+  const states = Object.keys(g.counts).sort((a, b) => (ORDER.indexOf(a) + 99) % 99 - (ORDER.indexOf(b) + 99) % 99);
+  return states.map(s => `<span class="cnt" style="--c:${colorFor(s)}" title="${esc(s)}">${esc(SHORT[s] || s)} ${g.counts[s]}</span>`).join("");
+}
+
+function groupRow(g){
+  const j = g.rep;
+  const open = expanded.has(g.key);
+  const where = g.nRunning > 1 ? `${whereCell(j)} <span class="muted">+${g.nRunning - 1} 个在跑</span>` : whereCell(j);
+  return `<tr class="grp ${open ? "open" : ""}" data-group="${esc(g.key)}" id="row-${esc(jobKey(j))}">
+    <td class="tog"><span class="tri">▶</span></td>
+    <td class="name" title="${esc(g.name)}  (${g.jobs.length} 个 job)">${esc(g.name)}<span class="count">×${g.jobs.length}</span></td>
+    <td>${esc(g.cluster)}</td>
+    <td class="jid" data-copy="${esc(j.id)}" title="点击复制">${esc(j.id)}</td>
+    <td>${stBadge(j.state)}<span class="cnts">${countPills(g)}</span></td>
+    <td>${esc(g.qosList.join(", ") || "-")}</td>
+    <td class="part" title="${esc(j.partition)}">${esc(j.partition || "-")}</td>
+    <td class="where" title="${esc(j.nodelist || j.reason)}">${where}</td>
+    <td class="num">${timeUsedCell(j)}</td>
+    <td class="num">${whenCell(j)}</td>
+    <td>${depsCell(j)}</td>
+  </tr>`;
+}
+
+// ---------------- 渲染 ----------------
+function renderJobs(){
+  const groups = buildGroups(lastData.jobs).filter(groupVisible);
+  groupOfJob = {};
+  const rows = [];
+  let nJobs = 0;
+  for (const g of groups){
+    nJobs += g.jobs.length;
+    g.jobs.forEach(j => groupOfJob[jobKey(j)] = g.key);
+    if (g.jobs.length === 1){
+      const j = g.jobs[0];
+      rows.push(`<tr class="one" id="row-${esc(jobKey(j))}"><td class="tog"></td>${jobCells(j, esc(j.name))}</tr>`);
+      continue;
+    }
+    rows.push(groupRow(g));
+    if (expanded.has(g.key)){
+      for (const j of g.jobs){
+        const isRep = j === g.rep;
+        rows.push(`<tr class="child"${isRep ? "" : ` id="row-${esc(jobKey(j))}"`}><td class="tog"></td>${jobCells(j, isRep ? "↳ 当前" : "↳")}</tr>`);
+      }
+    }
+  }
+  document.getElementById("jobsBody").innerHTML = rows.join("")
+    || `<tr><td colspan="11" class="empty">没有符合条件的 job</td></tr>`;
+  document.getElementById("summary").textContent = `${groups.length} 组 · ${nJobs} 个 job`;
+}
+
+function renderQos(){
+  const grid = document.getElementById("qosGrid");
+  grid.style.display = qosCollapsed ? "none" : "";
+  document.getElementById("qosToggle").textContent = qosCollapsed ? "展开" : "收起";
+  grid.innerHTML = (lastData.clusters || []).map(c => {
+    const dot = `<span class="dot" style="--c:${c.ok ? "var(--ok)" : "var(--bad)"}"></span>`;
+    if (!c.ok) return `<div class="card"><div class="card-h">${dot}${esc(c.name)}</div><div class="card-err">${esc(c.error || "error")}</div></div>`;
+    const mr = c.qos.reduce((a, q) => a + q.mine_running, 0), mp = c.qos.reduce((a, q) => a + q.mine_pending, 0);
+    const loadTip = c.load_private ? "这个集群的 squeue 只能看到你自己的 job（PrivateData），没法统计全集群" : "所有用户在这个 QoS 上 运行 / 排队 的 job 数";
+    const rows = c.qos.map(q => {
+      const sel = filters.qos === c.name + "|" + q.name;
+      const maxJ = parseInt(q.max_jobs_pu, 10), maxS = parseInt(q.max_submit_pu, 10);
+      const full = maxJ && q.mine_running >= maxJ;
+      const subfull = maxS && q.mine_running + q.mine_pending >= maxS;
+      const idle = !q.mine_running && !q.mine_pending;
+      const n = (v, cls) => v === null || v === undefined ? `<span class="n-0">—</span>` : `<span class="${v ? cls : "n-0"}">${v}</span>`;
+      const tags = (q.configured ? `<span class="tag cfg">config</span>` : "")
+        + (subfull ? `<span class="tag subfull">提交已满</span>` : full ? `<span class="tag full">运行已满</span>` : "");
+      return `<tr class="${sel ? "sel" : ""} ${subfull ? "subfull" : full ? "full" : ""} ${idle ? "idle" : ""}" data-qos="${esc(c.name + "|" + q.name)}">
+        <td class="qname">${esc(q.name)}${tags}${q.note ? `<span class="note">${esc(q.note)}</span>` : ""}</td>
+        <td class="mine">${n(q.mine_running, "n-r")} / ${n(q.mine_pending, "n-pd")}</td>
+        <td title="${esc(loadTip)}">${c.load_private ? `<span class="n-0">隐藏</span>` : `${n(q.all_running, "n-r")} / ${n(q.all_pending, "n-pd")}`}</td>
+        <td class="lim">${esc(q.max_jobs_pu || "-")}</td>
+        <td class="lim">${esc(q.max_submit_pu || "-")}</td>
+        <td class="lim">${esc(q.max_wall || "-")}</td>
+        <td class="lim tres">${esc((q.max_tres_pu || "-").replace(/,/g, ", "))}</td>
+      </tr>`;
+    }).join("");
+    return `<div class="card">
+      <div class="card-h">${dot}${esc(c.name)}<span class="muted">我的：<span class="n-r">${mr}</span> 运行 · <span class="n-pd">${mp}</span> 排队</span></div>
+      <table class="qos">
+        <thead><tr><th>QoS</th><th>我的</th><th title="${esc(loadTip)}">全集群</th>
+          <th title="每人最多同时运行的 job 数 (MaxJobsPU)">MaxJobs</th>
+          <th title="每人最多提交的 job 数 (MaxSubmitPU)">MaxSubmit</th>
+          <th title="单个 job 最长时间 (MaxWall)">MaxWall</th>
+          <th title="每人资源上限 (MaxTRESPU)">MaxTRES/人</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="7" class="empty">没查到 QoS（可以在 config.yaml 里手动写）</td></tr>`}</tbody>
+      </table></div>`;
+  }).join("");
+}
+
+function renderFilters(){
+  const csel = document.getElementById("clusterFilter");
+  const qsel = document.getElementById("qosFilter");
+  const clusters = (lastData.clusters || []).map(c => c.name);
+  csel.innerHTML = `<option value="">所有集群</option>` + clusters.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+  const qopts = [];
+  for (const c of lastData.clusters || []) for (const q of c.qos || []) qopts.push(c.name + "|" + q.name);
+  if (filters.qos && !qopts.includes(filters.qos)) qopts.push(filters.qos);
+  qsel.innerHTML = `<option value="">所有 QoS</option>` + qopts.map(v => `<option value="${esc(v)}">${esc(v.replace("|", " / "))}</option>`).join("");
+  csel.value = filters.cluster; qsel.value = filters.qos;
+  document.getElementById("stateFilter").value = filters.state;
+}
+
+function renderErrors(){
+  // 连不上的集群在 QoS 卡片里已经显示了错误，这里不重复
+  const shown = new Set((lastData.clusters || []).filter(c => !c.ok).map(c => `${c.name}: ${c.error}`));
+  const errs = (lastData.errors || []).filter(e => !shown.has(e));
+  document.getElementById("errors").innerHTML = errs.length
+    ? `<div class="errbox">${errs.map(e => `<div>${esc(e)}</div>`).join("")}</div>` : "";
+}
+
+function render(){
+  if (!lastData) return;
+  jobsByKey = {};
+  lastData.jobs.forEach(j => jobsByKey[jobKey(j)] = j);
+  renderFilters(); renderErrors(); renderQos(); renderJobs();
+  if (lastData.updated_at) document.getElementById("updated").textContent = "更新于 " + new Date(lastData.updated_at).toLocaleTimeString();
+}
+
+function setFilter(k, v){ filters[k] = v; savePref("filters", {...filters, search: ""}); render(); }
+
+// ---------------- 交互 ----------------
+function toast(msg){
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), 1200);
+}
+function copyText(s){
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(s);
+  const ta = document.createElement("textarea"); ta.value = s; document.body.appendChild(ta);
+  ta.select(); try{ document.execCommand("copy"); } finally { ta.remove(); }
+  return Promise.resolve();
+}
+function jumpTo(key){
+  const gk = groupOfJob[key];
+  if (!gk && !document.getElementById("row-" + key)){ toast("这个 job 不在当前列表里（可能被筛选掉或超出历史窗口）"); return; }
+  if (gk && !expanded.has(gk)){ expanded.add(gk); savePref("expanded", [...expanded]); renderJobs(); }
+  const row = document.getElementById("row-" + key) || document.querySelector(`tr[data-group="${CSS.escape(gk)}"]`);
+  if (!row) return;
+  row.scrollIntoView({block:"center", behavior:"smooth"});
+  row.classList.remove("flash"); void row.offsetWidth; row.classList.add("flash");
+}
+
+document.getElementById("jobsBody").addEventListener("click", e => {
+  const copy = e.target.closest("[data-copy]");
+  if (copy){ copyText(copy.dataset.copy).then(() => toast("已复制 " + copy.dataset.copy)); return; }
+  const dep = e.target.closest("[data-jump]");
+  if (dep){ jumpTo(dep.dataset.jump); return; }
+  const grp = e.target.closest("tr.grp");
+  if (grp){
+    const k = grp.dataset.group;
+    expanded.has(k) ? expanded.delete(k) : expanded.add(k);
+    savePref("expanded", [...expanded]); renderJobs();
+  }
+});
+document.getElementById("qosGrid").addEventListener("click", e => {
+  const tr = e.target.closest("tr[data-qos]");
+  if (!tr) return;
+  setFilter("qos", filters.qos === tr.dataset.qos ? "" : tr.dataset.qos);
+});
+document.getElementById("clusterFilter").addEventListener("change", e => setFilter("cluster", e.target.value));
+document.getElementById("qosFilter").addEventListener("change", e => setFilter("qos", e.target.value));
+document.getElementById("stateFilter").addEventListener("change", e => setFilter("state", e.target.value));
+document.getElementById("searchBox").addEventListener("input", e => { filters.search = e.target.value.trim(); renderJobs(); });
+document.getElementById("qosToggle").addEventListener("click", () => { qosCollapsed = !qosCollapsed; savePref("qosCollapsed", qosCollapsed); renderQos(); });
+document.getElementById("expandAll").addEventListener("click", () => {
+  buildGroups(lastData.jobs).filter(groupVisible).forEach(g => { if (g.jobs.length > 1) expanded.add(g.key); });
+  savePref("expanded", [...expanded]); renderJobs();
+});
+document.getElementById("collapseAll").addEventListener("click", () => { expanded.clear(); savePref("expanded", []); renderJobs(); });
+document.getElementById("refreshBtn").addEventListener("click", async () => {
+  document.getElementById("updated").textContent = "刷新中...";
+  try{ await fetch("api/refresh", {method:"POST"}); }catch(e){}
+  poll();
+});
+
+async function poll(){
+  try{
+    const res = await fetch("api/jobs");
+    lastData = await res.json();
+    render();
+  }catch(e){
+    document.getElementById("updated").textContent = "拉取失败: " + e;
+  }
+}
+
+poll();
+setInterval(poll, 8000);
+</script>
+</body>
+</html>

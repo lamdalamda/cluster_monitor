@@ -14,10 +14,20 @@
 # 前提：能免密登录（SSH key + agent，或者 key 没加密码）。这个程序不会处理
 # 交互式密码输入。
 
+#
+# qos（可选）：想在 QoS 面板里看哪些 QoS。不写的话会自动用
+#   sacctmgr show assoc user=$USER format=qos
+# 查到你能用的 QoS；不管写没写，你当前 job 实际用到的 QoS 都会自动补上。
+# 可以直接写名字，也可以写成 {name, note} 加一句备注（显示在 QoS 名字下面）。
+
 clusters:
   - name: ClusterA          # 显示用的名字，随便起
     ssh_host: clusterA      # ssh_host 对应 ~/.ssh/config 里的 Host
     enabled: true
+    # qos:
+    #   - freecpu
+    #   - name: freegpu
+    #     note: GPU，最长 2 天
 
   - name: ClusterB
     ssh_host: clusterB
@@ -31,9 +41,16 @@ clusters:
 # 多久轮询一次所有集群（秒）。SSH 有开销，别设太小；10-20秒比较合适。
 poll_interval_seconds: 15
 
-# sacct 往前查多少小时的历史作业（用来把已经跑完/失败的 job 也在依赖图里显示出来，
-# 否则依赖链里指向一个"已经不在squeue里"的job时就只能显示"未知"）。
+# sacct 往前查多少小时的历史作业（用来把已经跑完/失败的 job 也显示出来，
+# 这样同名 job / 依赖链里前面已经结束的那些也能看到最终状态）。
 history_hours: 48
+
+# QoS 面板里"全集群"那一列：每轮额外跑一次 squeue（所有用户）统计每个 QoS 的
+# 运行/排队数，看哪个 QoS 比较空。有的集群只让看自己的 job，会自动显示"隐藏"。
+show_cluster_load: true
+
+# QoS 列表和限额（sacctmgr）基本不变，多少分钟重新查一次
+qos_info_refresh_minutes: 30
 
 # SSH 单次命令超时（秒）
 ssh_timeout_seconds: 15
