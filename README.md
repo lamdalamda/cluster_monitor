@@ -44,6 +44,13 @@ python app.py
 
 然后浏览器打开 `http://127.0.0.1:8787`（端口见 config.yaml）。
 
+## 等待时间数据（waitlog/）
+
+每次刷新会把每个 job 的请求资源、第一次看到它排队时的集群状态（QoS 排队数、积压估计、
+Slurm 自己的预计开始时间、原因、优先级）和最终等了多久写进 `waitlog/jobs.csv`，
+另外追加 QoS / 分区的状态快照。用来以后建一个预测等待时间的模型，列的含义见
+[waitlog/README.md](waitlog/README.md)。
+
 ## 装成 systemd 服务（开机自启）
 
 ```bash

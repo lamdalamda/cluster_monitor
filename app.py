@@ -37,6 +37,7 @@ from flask import Flask, jsonify, render_template, request
 
 import backlog
 import jobfiles
+import waitlog
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.yaml")
@@ -61,9 +62,10 @@ SQUEUE_FIELDS = [
     "cpus",
     "tres",
     "workdir",
+    "priority",
     "dependency",
 ]
-SQUEUE_FORMAT = "%i|%P|%j|%u|%T|%M|%l|%D|%R|%q|%V|%S|%C|%b|%Z|%E"
+SQUEUE_FORMAT = "%i|%P|%j|%u|%T|%M|%l|%D|%R|%q|%V|%S|%C|%b|%Z|%Q|%E"
 
 SACCT_FIELDS = [
     "jobid",
@@ -77,10 +79,13 @@ SACCT_FIELDS = [
     "submit",
     "start",
     "end",
+    "req_tres",
+    "eligible",
     "workdir",
 ]
 SACCT_FORMAT = (
-    "JobID,JobName,State,Partition,QOS,NodeList,Elapsed,Timelimit,Submit,Start,End,WorkDir"
+    "JobID,JobName,State,Partition,QOS,NodeList,Elapsed,Timelimit,Submit,Start,End,"
+    "ReqTRES,Eligible,WorkDir"
 )
 
 QOS_LIMIT_FIELDS = ["name", "max_jobs_pu", "max_submit_pu", "max_wall", "max_tres_pu"]
@@ -222,6 +227,7 @@ def parse_squeue(lines, cluster_name):
             "cpus": rec["cpus"],
             "tres": rec["tres"] if rec["tres"] not in ("N/A", "(null)") else "",
             "workdir": rec["workdir"],
+            "priority": rec["priority"],
             "dependency_raw": rec["dependency"] if rec["dependency"] != "(null)" else "",
             "deps": parse_dependency(rec["dependency"]),
             "source": "squeue",
@@ -256,6 +262,8 @@ def parse_sacct(lines, cluster_name):
             "start": clean_time(rec["start"]),
             "end": clean_time(rec["end"]),
             "workdir": rec["workdir"],
+            "req_tres": rec["req_tres"],
+            "eligible": clean_time(rec["eligible"]),
             "dependency_raw": "",
             "deps": [],
             "source": "sacct",
@@ -351,6 +359,11 @@ class Backend:
         self.backlog = {}  # cluster name -> {"result": {...}, "model": {...}, "fetched_at": t}
         # 需要 2FA 的集群：先停一阵子不自动重试（"立即刷新"会强制重试）
         self.auth_blocked = {}  # cluster name -> {"until": t, "error": str}
+        # 每次刷新把请求资源 / 当时的集群状态 / 等待时间记到 waitlog/*.csv（以后建模用）
+        self.waitlog = None
+        if config.get("waitlog", True):
+            self.waitlog = waitlog.WaitLog(
+                os.path.join(APP_DIR, config.get("waitlog_dir", "waitlog")))
         self.load_cache()
 
     def clusters(self):
@@ -484,6 +497,14 @@ class Backend:
             r = self.poll_cluster(c, task.get("force", True))
             with self.lock:
                 self.store_result(r)
+            if r["ok"] and self.waitlog:
+                try:
+                    self.waitlog.update(r)
+                    with self.lock:
+                        self.results.get("_errors", {}).pop("waitlog", None)
+                except Exception as e:  # noqa: BLE001  记录失败不影响刷新
+                    with self.lock:
+                        self.results.setdefault("_errors", {})["waitlog"] = f"写 waitlog 出错: {e}"
             self._step_done()
             self.save_cache()
         with self.lock:

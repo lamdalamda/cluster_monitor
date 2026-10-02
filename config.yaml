@@ -81,6 +81,11 @@ backlog_refresh_minutes: 5
 # 不会发送任何验证码，只是再连一次看看 2FA 是否已经在别处验证过了。
 auth_retry_minutes: 10
 
+# 等待时间数据收集：每次刷新把每个 job 的请求资源、第一次看到它排队时的集群状态、
+# 最终等了多久写进 waitlog_dir 下的 csv（相对 app.py 所在目录），以后用来建预测模型
+waitlog: true
+waitlog_dir: waitlog
+
 # SSH 单次命令超时（秒）
 ssh_timeout_seconds: 15
 

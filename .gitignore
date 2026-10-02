@@ -2,3 +2,6 @@
 .dashboard_cache.json.tmp
 __pycache__/
 *.bak
+waitlog/*.csv
+waitlog/*.old
+waitlog/*.tmp
