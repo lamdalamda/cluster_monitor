@@ -44,6 +44,19 @@ python app.py
 
 然后浏览器打开 `http://127.0.0.1:8787`（端口见 config.yaml）。
 
+## 装成 systemd 服务（开机自启）
+
+```bash
+./install.sh                                  # 会自己 sudo；默认用 pymatgen250508 那个 python
+PYTHON=/path/to/python ./install.sh           # 换一个 python
+./install.sh --uninstall                      # 删除服务
+```
+
+服务名 `hpc-dashboard`，以你自己的用户身份运行（用你的 `~/.ssh/config` 和 key；系统服务
+拿不到桌面的 ssh-agent，所以 key 不能设密码）。看日志 `journalctl -u hpc-dashboard -f`，
+改了代码或 config.yaml 之后 `sudo systemctl restart hpc-dashboard`。装之前先把手动跑的
+`python app.py` 停掉，不然端口会冲突。
+
 ## 界面说明
 
 **QoS 面板**（每个集群一张卡片）
@@ -85,7 +98,14 @@ python app.py
   `WorkDir`）：`ls -lt`，再对 `inspect_files` 里每个模式（默认 `vasp.out`、`Slab*.log`、
   slurm 输出文件 `*{id}*.out*`）取最新的匹配文件 tail + grep。每个 job 下面会多一行：
   路径（点击复制）、文件数、vasp.out 的离子步 / F / dE / 电子步、是否收敛、最后一条报错；
-  点"详情"看完整的 `ls -lt` 和 tail。读过的会缓存，点"重新读取"才重新读
+  点"详情"看完整的 `ls -lt` 和 tail。读过的会缓存，点"重新读取"才重新读。
+  多个 job 共用同一个目录时只读一次（每个 job 只额外找自己的 slurm 输出文件），
+  并显示"同目录"还有哪些 job
+- 顶部的**提醒**：
+  - 同目录同时运行：好几个 job（不同的 job id，同一个 array 的 task 不算）同时 RUNNING
+    在同一个目录里，一般是 dependency 没设对。这个只看 squeue，不用展开
+  - 目录过大：读目录时 `du -sk` 的结果超过 `dir_size_warn_gb`（默认 30G）
+  - 点 job id 跳过去，点路径复制
 
 ## 常见调整
 

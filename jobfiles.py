@@ -1,10 +1,12 @@
 """
 看 job 工作目录里有什么
 ======================
-展开一组 job 时，对每个 job 的工作目录（squeue %Z / sacct WorkDir）跑一次：
-- ls -lt：目录里有哪些文件、什么时候改的
-- 对 config.yaml 里 inspect_files 的每个模式（默认 vasp.out、Slab*.log），取最新的
-  那个匹配文件：tail 最后几行 + grep 一下关键行（离子步、收敛、报错）
+展开一组 job 时，对每个 job 的工作目录（squeue %Z / sacct WorkDir）跑一次；
+多个 job 共用同一个目录时只读一次：
+- ls -lt：目录里有哪些文件、什么时候改的；du -sk：目录总大小（带超时）
+- 对 config.yaml 里 inspect_files 的每个模式（默认 vasp.out、Slab*.log、*{id}*.out*），
+  取最新的那个匹配文件：tail 最后几行 + grep 一下关键行（离子步、收敛、报错）。
+  带 {id} 的模式对这个目录里的每个 job 各找一次（每个 job 自己的 slurm 输出）。
 然后在本地解析成摘要（离子步数、能量、是否收敛、最后一条报错）。
 """
 
@@ -30,23 +32,34 @@ ERROR_RE = re.compile(
 LS_RE = re.compile(r"^([-dlcbps])\S*\s+\d+\s+\S+\s+\S+\s+(\d+)\s+(\S+)\s+(.+)$")
 
 
-def build_cmd(jobs, patterns, tail_lines=30, ls_lines=40):
-    """jobs: [(jobid, workdir)]。每个 job 放在子 shell 里，cd 失败不影响后面的。"""
+def build_cmd(dirs, patterns, tail_lines=30, ls_lines=40, du_timeout=20):
+    """dirs: [(workdir, [jobid, ...])]。每个目录放在子 shell 里，cd 失败不影响后面的。
+    输出里目录用序号 @@DIR <n> 标记（不用路径，免得路径里有奇怪字符）。"""
+
+    def one_file(pat, tag):
+        return (
+            f"f=$(ls -td -- {pat} 2>/dev/null | head -n 1); "
+            f"if [ -n \"$f\" ] && [ -f \"$f\" ]; then echo \"@@FILE {tag}|$f\"; "
+            f"tail -n {int(tail_lines)} -- \"$f\"; echo @@GREP; "
+            f"grep -aE '{GREP_RE}' -- \"$f\" | tail -n 8; fi"
+        )
+
     parts = []
-    for jid, workdir in jobs:
+    for n, (workdir, ids) in enumerate(dirs):
         file_cmds = []
         for pat in patterns:
-            # 模式里的 {id} 换成 job id（比如 slurm-{id}.out）；模式来自你自己的 config，不转义，允许通配符
-            pat = pat.replace("{id}", re.sub(r"[^\w]", "", jid.split("_")[0]))
-            file_cmds.append(
-                f"f=$(ls -td -- {pat} 2>/dev/null | head -n 1); "
-                f"if [ -n \"$f\" ] && [ -f \"$f\" ]; then echo \"@@FILE $f\"; "
-                f"tail -n {int(tail_lines)} -- \"$f\"; echo @@GREP; "
-                f"grep -aE '{GREP_RE}' -- \"$f\" | tail -n 8; fi"
-            )
+            # 模式来自你自己的 config，不转义，允许通配符；{id} 换成每个 job 的 id
+            if "{id}" in pat:
+                for jid in ids:
+                    clean = re.sub(r"[^\w]", "", jid.split("_")[0])
+                    file_cmds.append(one_file(pat.replace("{id}", clean), clean))
+            else:
+                file_cmds.append(one_file(pat, ""))
+        du = (f"echo \"@@DU $(timeout {int(du_timeout)} du -sk . 2>/dev/null | cut -f1)\"; "
+              if du_timeout else "")
         parts.append(
-            f"echo '@@JOB {jid}'; ( if cd -- {shlex.quote(workdir)} 2>/dev/null; then "
-            f"echo \"@@COUNT $(ls -1A | wc -l)\"; echo @@LS; "
+            f"echo '@@DIR {n}'; ( if cd -- {shlex.quote(workdir)} 2>/dev/null; then "
+            f"echo \"@@COUNT $(ls -1A | wc -l)\"; {du}echo @@LS; "
             f"ls -lt --time-style=+%m-%d_%H:%M 2>/dev/null | head -n {int(ls_lines) + 1}; "
             + "; ".join(file_cmds)
             + "; else echo @@NODIR; fi )"
@@ -92,14 +105,17 @@ def parse_file(name, tail, grep):
 
 
 def parse_output(output):
-    """-> {jobid: {...}}"""
+    """-> {目录序号: {...}}"""
     results, cur, section, cur_file = {}, None, None, None
     for raw in output.splitlines():
         line = raw.rstrip("\n")
         s = line.strip()
-        if s.startswith("@@JOB "):
-            cur = {"exists": True, "count": None, "ls": [], "files": []}
-            results[s[6:].strip()] = cur
+        if s.startswith("@@DIR "):
+            cur = {"exists": True, "count": None, "size_kb": None, "ls": [], "files": []}
+            try:
+                results[int(s[6:])] = cur
+            except ValueError:
+                cur = None
             section, cur_file = None, None
             continue
         if cur is None:
@@ -108,6 +124,10 @@ def parse_output(output):
             break
         if s == "@@NODIR":
             cur["exists"] = False
+            continue
+        if s.startswith("@@DU"):
+            v = s[4:].strip()
+            cur["size_kb"] = int(v) if v.isdigit() else None  # 空 = du 超时
             continue
         if s.startswith("@@COUNT "):
             try:
@@ -119,7 +139,8 @@ def parse_output(output):
             section = "ls"
             continue
         if s.startswith("@@FILE "):
-            cur_file = {"name": s[7:].strip(), "tail": [], "grep": []}
+            tag, _, fname = s[7:].partition("|")
+            cur_file = {"name": fname.strip(), "for_id": tag.strip(), "tail": [], "grep": []}
             cur["files"].append(cur_file)
             section = "tail"
             continue

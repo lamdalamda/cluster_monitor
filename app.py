@@ -38,11 +38,12 @@ from flask import Flask, jsonify, render_template, request
 import backlog
 import jobfiles
 
-CONFIG_PATH = "config.yaml"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(APP_DIR, "config.yaml")
 ASKPASS = os.path.join(APP_DIR, "ssh_askpass_abort.sh")
 CACHE_PATH = os.path.join(APP_DIR, ".dashboard_cache.json")
-INSPECT_CHUNK = 8  # 每次 SSH 看几个 job 的目录
+INSPECT_CHUNK = 8  # 每次 SSH 看几个目录
+MAX_IDS_PER_DIR = 10  # 同一个目录里最多给几个 job 找各自的 slurm 输出文件
 
 SQUEUE_FIELDS = [
     "jobid",
@@ -315,6 +316,15 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def base_jid(jid):
+    """'123_4' -> '123'（array job 的各个 task 算同一个 job）"""
+    return jid.split("_")[0]
+
+
+def dir_key(cluster, workdir):
+    return f"{cluster}\u0000{workdir}"
+
+
 class Backend:
     """所有 SSH 操作都放进 self.queue，由一个后台线程依次执行；网页只读 self 里的结果。"""
 
@@ -331,8 +341,10 @@ class Backend:
         self.last_refresh = None
         self.results = {}  # cluster name -> 给前端的集群结果（连不上时是旧数据 + 错误）
         self.last_good = {}  # cluster name -> 上一次成功的结果
-        self.inspect = {}  # "cluster:jobid" -> 目录信息
-        self.inspect_pending = set()
+        # 目录信息按 (集群, 目录) 存：多个 job 共用一个目录时只读一次
+        self.inspect_dirs = {}  # dir_key -> {"dir", "exists", "size_kb", "ls", "files", "at"}
+        self.inspect_job_err = {}  # "cluster:jobid" -> {"error", "at"}（比如没有工作目录信息）
+        self.inspect_pending = set()  # 正在排队读取的 dir_key
         # sacctmgr 的 QoS 信息基本不变，缓存起来，不用每次都查
         self.qos_info = {}  # cluster name -> {"assoc": [...], "limits": {...}, "fetched_at": t}
         # 排队积压要拉全集群的 squeue，比较重，隔几分钟才拉一次
@@ -356,7 +368,8 @@ class Backend:
             return
         self.last_good = data.get("last_good", {})
         self.results = data.get("results", {})
-        self.inspect = data.get("inspect", {})
+        self.inspect_dirs = data.get("inspect_dirs", {})
+        self.inspect_job_err = data.get("inspect_job_err", {})
         self.qos_info = data.get("qos_info", {})
         self.backlog = data.get("backlog", {})
         self.last_refresh = data.get("last_refresh")
@@ -364,7 +377,8 @@ class Backend:
     def save_cache(self):
         with self.lock:
             data = json.dumps({
-                "last_good": self.last_good, "results": self.results, "inspect": self.inspect,
+                "last_good": self.last_good, "results": self.results,
+                "inspect_dirs": self.inspect_dirs, "inspect_job_err": self.inspect_job_err,
                 "qos_info": self.qos_info, "backlog": self.backlog,
                 "last_refresh": self.last_refresh,
             }, ensure_ascii=False)
@@ -392,26 +406,41 @@ class Backend:
             self._enqueue({"kind": "refresh", "label": "刷新作业状态", "steps": n, "force": force})
             return True
 
+    def _jobs_of(self, cluster):
+        return (self.last_good.get(cluster) or {}).get("jobs", {})
+
     def enqueue_inspect(self, keys, force=False):
-        """keys: ["cluster:jobid", ...]。已经看过的（除非 force）和正在排队的跳过。"""
-        by_cluster = {}
+        """keys: ["cluster:jobid", ...]。按目录去重：已经读过的目录（除非 force）
+        和正在排队的目录跳过。"""
+        todo = {}  # cluster -> {workdir: None}
+        changed = False
         with self.lock:
             for key in dict.fromkeys(keys):
-                if key in self.inspect_pending or (key in self.inspect and not force):
-                    continue
                 cluster, _, jid = key.partition(":")
                 if not self.cluster_by_name(cluster):
                     continue
-                by_cluster.setdefault(cluster, []).append(jid)
+                d = self._jobs_of(cluster).get(jid, {}).get("workdir", "")
+                if not d:
+                    self.inspect_job_err[key] = {
+                        "error": "没有工作目录信息（squeue/sacct 里没查到 WorkDir）", "at": now_iso()}
+                    changed = True
+                    continue
+                dk = dir_key(cluster, d)
+                if dk in self.inspect_pending or (dk in self.inspect_dirs and not force):
+                    continue
+                todo.setdefault(cluster, {})[d] = None
             added = 0
-            for cluster, ids in by_cluster.items():
-                for i in range(0, len(ids), INSPECT_CHUNK):
-                    chunk = ids[i:i + INSPECT_CHUNK]
-                    self.inspect_pending.update(f"{cluster}:{j}" for j in chunk)
-                    self._enqueue({"kind": "inspect", "cluster": cluster, "ids": chunk,
-                                   "label": f"查看 {cluster} 上 {len(chunk)} 个 job 的目录",
+            for cluster, dirs in todo.items():
+                dirs = list(dirs)
+                for i in range(0, len(dirs), INSPECT_CHUNK):
+                    chunk = dirs[i:i + INSPECT_CHUNK]
+                    self.inspect_pending.update(dir_key(cluster, d) for d in chunk)
+                    self._enqueue({"kind": "inspect", "cluster": cluster, "dirs": chunk,
+                                   "label": f"查看 {cluster} 上 {len(chunk)} 个目录",
                                    "steps": 1})
                     added += len(chunk)
+            if changed and not added:
+                self.version += 1
             return added
 
     def worker(self):
@@ -478,48 +507,50 @@ class Backend:
             self.results[name] = {**r, "at": None, "stale_since": None}
 
     def run_inspect(self, task):
-        cluster, ids = task["cluster"], task["ids"]
+        cluster, dirs = task["cluster"], task["dirs"]
         self._step(task["label"])
         c = self.cluster_by_name(cluster)
-        keys = [f"{cluster}:{j}" for j in ids]
+        dks = [dir_key(cluster, d) for d in dirs]
+        cfg = self.config
         try:
             with self.lock:
-                known = (self.last_good.get(cluster) or {}).get("jobs", {})
-                todo = [(j, known.get(j, {}).get("workdir", "")) for j in ids]
+                # 每个目录里有哪些 job（给 {id} 模式用，各找各的 slurm 输出），新的在前
+                ids_in = {d: [] for d in dirs}
+                for jid, j in self._jobs_of(cluster).items():
+                    if j.get("workdir") in ids_in:
+                        ids_in[j["workdir"]].append(jid)
+            plan = [(d, sorted({base_jid(x) for x in ids_in[d]}, key=lambda x: -int(x)
+                               if x.isdigit() else 0)[:MAX_IDS_PER_DIR]) for d in dirs]
             results = {}
-            for j, d in todo:
-                if not d:
-                    results[j] = {"error": "没有工作目录信息（squeue/sacct 里没查到 WorkDir）"}
-            todo = [(j, d) for j, d in todo if d]
             blocked = self.auth_blocked.get(cluster)
-            if todo and c and blocked and time.time() < blocked["until"]:
-                for j, _ in todo:
-                    results[j] = {"error": "集群需要 2FA，先在终端登录一次再试"}
-                todo = []
-            if todo and c:
-                cfg = self.config
+            if not c:
+                err = "集群已经不在 config 里了"
+            elif blocked and time.time() < blocked["until"]:
+                err = "集群需要 2FA，先在终端登录一次再试"
+            else:
+                du_timeout = cfg.get("dir_size_timeout_seconds", 20)
                 cmd = jobfiles.build_cmd(
-                    todo, cfg.get("inspect_files", jobfiles.DEFAULT_PATTERNS),
-                    cfg.get("inspect_tail_lines", 30))
+                    plan, cfg.get("inspect_files", jobfiles.DEFAULT_PATTERNS),
+                    cfg.get("inspect_tail_lines", 30), du_timeout=du_timeout)
+                timeout = cfg.get("ssh_timeout_seconds", 15) * 2 + du_timeout * len(dirs)
                 try:
-                    ok, out, err = run_ssh(c["ssh_host"], cmd,
-                                           cfg.get("ssh_timeout_seconds", 15) * 2)
+                    ok, out, err = run_ssh(c["ssh_host"], cmd, timeout)
                 except NeedInput as e:
                     ok, out, err = False, "", f"需要交互输入（2FA/密码）：{e}"
-                parsed = jobfiles.parse_output(out) if ok else {}
-                for j, d in todo:
-                    if not ok:
-                        results[j] = {"error": err or "ssh 失败"}
-                    elif j in parsed:
-                        results[j] = {**parsed[j], "dir": d}
-                    else:
-                        results[j] = {"error": "没拿到输出", "dir": d}
+                if ok:
+                    parsed = jobfiles.parse_output(out)
+                    for n, (d, _) in enumerate(plan):
+                        results[d] = parsed.get(n) or {"error": "没拿到输出"}
+                    err = None
+                else:
+                    err = err or "ssh 失败"
             with self.lock:
-                for j, res in results.items():
-                    self.inspect[f"{cluster}:{j}"] = {**res, "at": now_iso()}
+                for d in dirs:
+                    res = results.get(d) or {"error": err}
+                    self.inspect_dirs[dir_key(cluster, d)] = {**res, "dir": d, "at": now_iso()}
         finally:
             with self.lock:
-                self.inspect_pending.difference_update(keys)
+                self.inspect_pending.difference_update(dks)
             self._step_done()
 
     def auto_refresh_loop(self, minutes):
@@ -578,7 +609,7 @@ class Backend:
                     "backlog": r.get("backlog"),
                 })
             errors.extend(self.results.get("_errors", {}).values())
-            keys = {f"{j['cluster']}:{j['id']}" for j in jobs}
+            inspect, pending = self.inspect_view(jobs)
             return json.loads(json.dumps({
                 "version": self.version,
                 "progress": self.progress(),
@@ -586,9 +617,66 @@ class Backend:
                 "clusters": clusters,
                 "updated_at": self.last_refresh,
                 "errors": errors,
-                "inspect": {k: v for k, v in self.inspect.items() if k in keys},
-                "inspect_pending": sorted(self.inspect_pending & keys),
+                "inspect": inspect,
+                "inspect_pending": pending,
+                "alerts": self.alerts(jobs),
+                "settings": {"dir_size_warn_gb": self.config.get("dir_size_warn_gb", 30)},
             }))
+
+    def inspect_view(self, jobs):
+        """把按目录存的信息展开成每个 job 一份：只留这个 job 自己的 {id} 文件，
+        并注明同目录还有哪些 job。调用方已持有 self.lock。"""
+        by_dir = {}
+        for j in jobs:
+            if j.get("workdir"):
+                by_dir.setdefault(dir_key(j["cluster"], j["workdir"]), []).append(j["id"])
+        view, pending = {}, []
+        for j in jobs:
+            key = f"{j['cluster']}:{j['id']}"
+            if key in self.inspect_job_err:
+                view[key] = self.inspect_job_err[key]
+                continue
+            if not j.get("workdir"):
+                continue
+            dk = dir_key(j["cluster"], j["workdir"])
+            if dk in self.inspect_pending:
+                pending.append(key)
+            ins = self.inspect_dirs.get(dk)
+            if ins:
+                me = base_jid(j["id"])
+                view[key] = {**ins,
+                             "files": [f for f in ins.get("files", [])
+                                       if f.get("for_id", "") in ("", me)],
+                             "shared": [x for x in by_dir[dk] if x != j["id"]]}
+        return view, pending
+
+    def alerts(self, jobs):
+        """界面上的小提醒。调用方已持有 self.lock。"""
+        out = []
+        # 1) 好几个 job 同时在同一个目录里跑（一般是 dependency 没设对）
+        #    同一个 array job 的不同 task 共用目录是正常的，不算
+        running = {}
+        for j in jobs:
+            if j["state"] in ACTIVE and j.get("workdir"):
+                running.setdefault((j["cluster"], j["workdir"]), []).append(j)
+        for (cluster, d), js in sorted(running.items()):
+            if len({base_jid(j["id"]) for j in js}) > 1:
+                out.append({"type": "same_dir", "cluster": cluster, "dir": d,
+                            "jobs": sorted(j["id"] for j in js),
+                            "stale": any(j.get("stale") for j in js)})
+        # 2) 目录太大（只对读过的目录有数）
+        limit_kb = self.config.get("dir_size_warn_gb", 30) * 1024 * 1024
+        by_dir = {}
+        for j in jobs:
+            if j.get("workdir"):
+                by_dir.setdefault(dir_key(j["cluster"], j["workdir"]), []).append(j["id"])
+        for dk, ins in sorted(self.inspect_dirs.items()):
+            size = ins.get("size_kb")
+            if size and size > limit_kb and dk in by_dir:
+                cluster, _, d = dk.partition("\u0000")
+                out.append({"type": "big_dir", "cluster": cluster, "dir": d, "size_kb": size,
+                            "jobs": sorted(by_dir[dk])})
+        return out
 
     def poll_cluster(self, c, force=False):
         cfg = self.config

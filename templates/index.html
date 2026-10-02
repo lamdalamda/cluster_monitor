@@ -114,7 +114,7 @@
   #jobs tr.detail td{padding:0 10px 5px;line-height:1.5;background:var(--child);white-space:normal;border-bottom:1px solid var(--border);}
   #jobs tr.child + tr.detail td{border-top:none;}
   .insp{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;font-size:12px;padding-left:18px;}
-  .insp .path{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--muted);cursor:copy;}
+  .insp .path{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--muted);cursor:copy;word-break:break-all;}
   .insp .path:hover{color:var(--accent);}
   .insp .ff b{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:500;}
   .insp .v{font-variant-numeric:tabular-nums;}
@@ -127,6 +127,19 @@
   .insp-full h4{margin:0 0 4px;font-size:11px;font-weight:500;color:var(--muted);}
   .insp-full .tails{display:flex;flex-direction:column;gap:8px;min-width:0;}
   @media (max-width:900px){ .insp-full{grid-template-columns:1fr;} }
+  /* 提醒 */
+  #alerts{margin-bottom:12px;}
+  .alertbox{background:#2e2610;border:1px solid #5c4a14;border-radius:6px;padding:6px 10px;font-size:12px;}
+  .alertbox .ah{color:var(--warn);font-weight:600;margin-right:8px;}
+  .alertbox .ah button{font-size:11px;padding:0 7px;margin-left:8px;font-weight:400;}
+  .alertbox .ai{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;padding:2px 0;}
+  .alertbox .ai .k{display:inline-block;font-size:10px;padding:0 5px;border-radius:3px;background:#4a3b10;color:var(--warn);}
+  .alertbox .ai .k.big{background:#4a1c1c;color:#ff9d9d;}
+  .alertbox .ai .p{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--muted);word-break:break-all;cursor:copy;}
+  .alertbox .ai .p:hover{color:var(--accent);}
+  .alertbox .ai a{color:var(--text);cursor:pointer;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-decoration:underline dotted;}
+  .alertbox .ai a:hover{color:var(--accent);}
+  .insp .size.big{color:#ff9d9d;font-weight:600;}
   #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--border);padding:6px 14px;border-radius:6px;opacity:0;transition:opacity .2s;pointer-events:none;}
   #toast.show{opacity:1;}
   @media (max-width:640px){
@@ -161,6 +174,7 @@
 </header>
 
 <main>
+  <div id="alerts"></div>
   <div id="errors"></div>
 
   <h2>QoS <button id="qosToggle">收起</button>
@@ -373,7 +387,6 @@ function groupRow(g){
 
 // ---------------- job 目录信息 ----------------
 const fmtSize = n => n < 1024 ? n + "B" : n < 1048576 ? (n / 1024).toFixed(0) + "K" : n < 1073741824 ? (n / 1048576).toFixed(1) + "M" : (n / 1073741824).toFixed(1) + "G";
-const shortPath = p => { const a = p.split("/").filter(Boolean); return a.length > 2 ? "…/" + a.slice(-2).join("/") : p; };
 const fnum = (v, d) => v === null || v === undefined ? "?" : v.toFixed(d);
 const fexp = v => v === null || v === undefined ? "?" : v.toExponential(1);
 
@@ -398,13 +411,19 @@ function detailRow(j){
   } else if (ins.error){
     body = `<span class="bad-tag" title="${esc(ins.error)}">${esc(ins.error)}</span> ${reload}`;
   } else {
-    const path = `<span class="path" data-copy="${esc(ins.dir)}" title="${esc(ins.dir)}（点击复制）">${esc(shortPath(ins.dir))}</span>`;
+    const path = `<span class="path" data-copy="${esc(ins.dir)}" title="点击复制路径">${esc(ins.dir)}</span>`;
+    const limitGb = (lastData.settings || {}).dir_size_warn_gb || 30;
+    const sizeHtml = ins.size_kb === null || ins.size_kb === undefined
+      ? (ins.exists ? `<span class="muted" title="du 超时或失败">大小 ?</span>` : "")
+      : `<span class="size${ins.size_kb > limitGb * 1048576 ? " big" : ""}" title="du -sk">${fmtSize(ins.size_kb * 1024)}</span>`;
+    const shared = ins.shared && ins.shared.length
+      ? `<span class="muted">同目录：${ins.shared.slice(0, 6).map(x => `<a class="dep" data-jump="${esc(j.cluster + ":" + x)}"><b>#${esc(x)}</b></a>`).join("")}${ins.shared.length > 6 ? ` 等 ${ins.shared.length} 个` : ""}</span>` : "";
     if (!ins.exists){
       body = `${path} <span class="bad-tag">目录不存在或没权限</span> ${reload}`;
     } else {
       const files = ins.files.length ? ins.files.map(fileSummary).join("") : `<span class="muted">没有匹配的输出文件</span>`;
       const open = detailOpen.has(k);
-      body = `${path}<span class="muted">${ins.count ?? "?"} 个文件</span>${files}
+      body = `${path}${sizeHtml}<span class="muted">${ins.count ?? "?"} 个文件</span>${shared}${files}
         <button data-insp-toggle="${esc(k)}">${open ? "收起详情" : "详情"}</button>${reload}
         <span class="muted">读取于 ${localTime(ins.at)}</span>`;
       if (open){
@@ -560,6 +579,29 @@ function renderFilters(){
   document.getElementById("stateFilter").value = filters.state;
 }
 
+let alertsAll = false;
+function renderAlerts(){
+  const al = lastData.alerts || [];
+  const el = document.getElementById("alerts");
+  if (!al.length){ el.innerHTML = ""; return; }
+  const limitGb = (lastData.settings || {}).dir_size_warn_gb || 30;
+  const jobLinks = a => a.jobs.slice(0, 8).map(id => `<a data-jump="${esc(a.cluster + ":" + id)}">#${esc(id)}</a>`).join(" ") + (a.jobs.length > 8 ? ` 等 ${a.jobs.length} 个` : "");
+  const item = a => a.type === "same_dir"
+    ? `<div class="ai"><span class="k">同目录同时运行</span><b>${esc(a.cluster)}</b> ${a.jobs.length} 个 job 在同一个目录里跑（dependency 可能没设对）：${jobLinks(a)}${a.stale ? ` <span class="muted">（旧数据）</span>` : ""}
+        <span class="p" data-copy="${esc(a.dir)}" title="点击复制路径">${esc(a.dir)}</span></div>`
+    : `<div class="ai"><span class="k big">目录过大</span><b>${esc(a.cluster)}</b> ${fmtSize(a.size_kb * 1024)} &gt; ${limitGb}G：${jobLinks(a)}
+        <span class="p" data-copy="${esc(a.dir)}" title="点击复制路径">${esc(a.dir)}</span></div>`;
+  const shown = alertsAll ? al : al.slice(0, 4);
+  el.innerHTML = `<div class="alertbox"><span class="ah">提醒 ${al.length}${al.length > 4 ? `<button id="alertsMore">${alertsAll ? "收起" : "显示全部"}</button>` : ""}</span>${shown.map(item).join("")}</div>`;
+}
+document.getElementById("alerts").addEventListener("click", e => {
+  if (e.target.id === "alertsMore"){ alertsAll = !alertsAll; renderAlerts(); return; }
+  const copy = e.target.closest("[data-copy]");
+  if (copy){ copyText(copy.dataset.copy).then(() => toast("已复制路径")); return; }
+  const jump = e.target.closest("[data-jump]");
+  if (jump) jumpTo(jump.dataset.jump);
+});
+
 function renderErrors(){
   // 连不上的集群在 QoS 卡片里已经显示了错误，这里不重复
   const shown = new Set((lastData.clusters || []).filter(c => !c.ok).map(c => `${c.name}: ${c.error}`));
@@ -573,7 +615,7 @@ function render(){
   jobsByKey = {};
   lastData.jobs.forEach(j => jobsByKey[jobKey(j)] = j);
   pendingInspect = new Set(lastData.inspect_pending || []);
-  renderFilters(); renderErrors(); renderQos(); renderBacklog(); renderJobs();
+  renderFilters(); renderAlerts(); renderErrors(); renderQos(); renderBacklog(); renderJobs();
   document.getElementById("updated").textContent = lastData.updated_at
     ? "数据更新于 " + new Date(lastData.updated_at).toLocaleString([], {month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit"})
     : "还没刷新过";

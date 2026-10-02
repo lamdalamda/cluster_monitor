@@ -56,6 +56,10 @@ inspect_files:
   - "Slab*.log"
   - "*{id}*.out*"      # slurm 的输出文件，比如 VASP_GPU-87704.out.txt
 inspect_tail_lines: 30
+# 读目录时顺便 du 一下大小，超过这么多 GB 就在界面顶部的"提醒"里报警
+dir_size_warn_gb: 30
+# du 的超时（秒），lustre 上目录很大时 du 可能很慢；设 0 = 不查大小
+dir_size_timeout_seconds: 20
 
 # sacct 往前查多少小时的历史作业（用来把已经跑完/失败的 job 也显示出来，
 # 这样同名 job / 依赖链里前面已经结束的那些也能看到最终状态）。
