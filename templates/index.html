@@ -260,7 +260,7 @@ const I18N = {
     bl_range_tip: "Local（只算本分区） – Global（算上共享节点的分区）",
     alerts: n => `提醒 ${n}`, al_same_dir: "同目录同时运行",
     al_same_dir_msg: n => `${n} 个 job 在同一个目录里跑（dependency 可能没设对）：`, al_stale: "（旧数据）",
-    al_big_dir: "目录过大",
+    al_big_dir: "目录过大", al_many_files: "文件过多", n_entries: n => `${n} 个文件`,
     copied: s => "已复制 " + s, copied_path: "已复制路径",
     not_in_list: "这个 job 不在当前列表里（可能被筛选掉或超出历史窗口）",
     bg: "后台：", bg_working: "处理中", bg_steps: (d, n) => `（${d}/${n} 步）`, bg_more: n => ` · 还有 ${n} 个任务`,
@@ -319,7 +319,7 @@ const I18N = {
     bl_range_tip: "Local (this partition only) – Global (incl. partitions sharing nodes)",
     alerts: n => `Alerts ${n}`, al_same_dir: "same folder",
     al_same_dir_msg: n => `${n} jobs running in the same folder (dependency may be wrong): `, al_stale: " (old data)",
-    al_big_dir: "folder too large",
+    al_big_dir: "folder too large", al_many_files: "too many files", n_entries: n => `${n} files`,
     copied: s => "Copied " + s, copied_path: "Path copied",
     not_in_list: "This job isn't in the current list (filtered out or outside the history window)",
     bg: "Background: ", bg_working: "working", bg_steps: (d, n) => ` (${d}/${n} steps)`, bg_more: n => ` · ${n} more queued`,
@@ -552,7 +552,8 @@ function detailRow(j){
     } else {
       const files = ins.files.length ? ins.files.map(fileSummary).join("") : `<span class="muted">${t("no_files")}</span>`;
       const open = detailOpen.has(k);
-      body = `${path}${sizeHtml}<span class="muted">${t("n_files", ins.count ?? "?")}</span>${shared}${files}
+      const manyFiles = ins.count > ((lastData.settings || {}).dir_files_warn || Infinity);
+      body = `${path}${sizeHtml}<span class="${manyFiles ? "size big" : "muted"}">${t("n_files", ins.count ?? "?")}</span>${shared}${files}
         <button data-insp-toggle="${esc(k)}">${open ? t("hide_details") : t("details")}</button>${reload}
         <span class="muted">${t("read_at", localTime(ins.at))}</span>`;
       if (open){
@@ -716,8 +717,11 @@ function renderAlerts(){
   const limitGb = (lastData.settings || {}).dir_size_warn_gb || 30;
   const jobLinks = a => a.jobs.slice(0, 8).map(id => `<a data-jump="${esc(a.cluster + ":" + id)}">#${esc(id)}</a>`).join(" ") + (a.jobs.length > 8 ? t("and_n", a.jobs.length) : "");
   const path = a => `<span class="p" data-copy="${esc(a.dir)}" title="${t("click_copy_path")}">${esc(a.dir)}</span>`;
+  const limitFiles = (lastData.settings || {}).dir_files_warn || 50;
   const item = a => a.type === "same_dir"
     ? `<div class="ai"><span class="k">${t("al_same_dir")}</span><b>${esc(a.cluster)}</b> ${t("al_same_dir_msg", a.jobs.length)}${jobLinks(a)}${a.stale ? ` <span class="muted">${t("al_stale")}</span>` : ""} ${path(a)}</div>`
+    : a.type === "many_files"
+    ? `<div class="ai"><span class="k">${t("al_many_files")}</span><b>${esc(a.cluster)}</b> ${t("n_entries", a.count)} &gt; ${limitFiles}: ${jobLinks(a)} ${path(a)}</div>`
     : `<div class="ai"><span class="k big">${t("al_big_dir")}</span><b>${esc(a.cluster)}</b> ${fmtSize(a.size_kb * 1024)} &gt; ${limitGb}G: ${jobLinks(a)} ${path(a)}</div>`;
   const shown = alertsAll ? al : al.slice(0, 4);
   el.innerHTML = `<div class="alertbox"><span class="ah">${t("alerts", al.length)}${al.length > 4 ? `<button id="alertsMore">${alertsAll ? t("collapse") : t("show_all")}</button>` : ""}</span>${shown.map(item).join("")}</div>`;

@@ -40,18 +40,23 @@ Each refresh runs **one SSH session per cluster** (clusters one after another) w
 
 ```bash
 cd cluster_monitor
-pip install -r requirements.txt
-
-# check that you can log in without a password first (no interactive password/2FA handling)
-ssh clusterA squeue --me
-
-# edit config.yaml: replace clusters with your own clusters and ssh aliases
-vim config.yaml
-
-python app.py
+python3 install.py
 ```
 
-Then open `http://127.0.0.1:8787` (port set in config.yaml).
+`install.py` is interactive (standard library only, any python3 works):
+1. picks the Python that will run the dashboard and checks / installs flask + pyyaml
+2. optionally reads `~/.ssh/config`, optionally SSHes to each Host to test which have Slurm
+   (only `command -v sbatch`; hosts asking for 2FA/password are skipped, nothing is typed),
+   and lets you pick the clusters
+3. asks for the listen address, port, auto refresh, history hours, folder size alert and
+   whether to collect wait-time data, then writes `config.yaml` from `config.example.yaml`
+   (comments kept; an existing config.yaml is backed up first)
+4. optionally installs the systemd service (see below)
+
+`config.yaml` is your own file and not tracked by git (the repo ships `config.example.yaml`),
+so pulling updates never conflicts with your settings. You can also copy
+`config.example.yaml` to `config.yaml` and edit it by hand. Run manually with
+`python app.py`, then open `http://127.0.0.1:8787` (port set in config.yaml).
 
 ### Wait-time data (waitlog/)
 
@@ -63,11 +68,8 @@ columns are described in [waitlog/README.md](waitlog/README.md).
 
 ### Run as a systemd service (start on boot)
 
-```bash
-./install.sh                                  # sudo's itself; defaults to the pymatgen250508 python
-PYTHON=/path/to/python ./install.sh           # use another python
-./install.sh --uninstall                      # remove the service
-```
+`python3 install.py` offers this as its last step (it runs the `sudo` commands and asks for
+your password); `python3 install.py --uninstall` removes it.
 
 The service is called `hpc-dashboard` and runs as your own user (using your
 `~/.ssh/config` and keys; a system service can't reach your desktop ssh-agent, so the keys
@@ -134,6 +136,7 @@ config.yaml: `sudo systemctl restart hpc-dashboard`. Stop any manually started
     in the same folder at once, usually a wrong dependency. Based on squeue only, no need
     to expand
   - folder too large: `du -sk` of a read folder exceeds `dir_size_warn_gb` (default 30G)
+  - too many files: a read folder has more than `dir_files_warn` entries (default 50)
   - click a job id to jump to it, click a path to copy it
 
 ### Common tweaks
@@ -194,18 +197,20 @@ config.yaml: `sudo systemctl restart hpc-dashboard`. Stop any manually started
 
 ```bash
 cd cluster_monitor
-pip install -r requirements.txt
-
-# 先测试一下你能不能免密连上（本程序不处理交互式密码/2FA）
-ssh clusterA squeue --me
-
-# 编辑 config.yaml，把 clusters 换成你自己的集群和 ssh 别名
-vim config.yaml
-
-python app.py
+python3 install.py
 ```
 
-然后浏览器打开 `http://127.0.0.1:8787`（端口见 config.yaml）。
+`install.py` 是交互式的（只用标准库，任何 python3 都能跑）：
+1. 选用哪个 Python 运行 dashboard，检查 / 安装 flask + pyyaml
+2. 可以读取 `~/.ssh/config`，可以挨个 ssh 上去测试哪些 Host 有 Slurm（只跑
+   `command -v sbatch`；要 2FA/密码的直接跳过，不会替你输入），然后选要监控的集群
+3. 问监听地址、端口、自动刷新、历史时长、目录大小报警、要不要收集等待时间数据，
+   以 `config.example.yaml` 为模板生成 `config.yaml`（保留注释；已有的会先备份）
+4. 可以顺便装成 systemd 服务（见下）
+
+`config.yaml` 是你自己的文件，不进 git（仓库里只有 `config.example.yaml`），所以以后
+拉更新不会和你的配置冲突。也可以手动把 `config.example.yaml` 复制成 `config.yaml` 再改。
+手动运行 `python app.py`，然后浏览器打开 `http://127.0.0.1:8787`（端口见 config.yaml）。
 
 ### 等待时间数据（waitlog/）
 
@@ -216,11 +221,8 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
 
 ### 装成 systemd 服务（开机自启）
 
-```bash
-./install.sh                                  # 会自己 sudo；默认用 pymatgen250508 那个 python
-PYTHON=/path/to/python ./install.sh           # 换一个 python
-./install.sh --uninstall                      # 删除服务
-```
+`python3 install.py` 最后一步会问要不要装（会执行 `sudo` 命令、提示输密码）；
+`python3 install.py --uninstall` 删除服务。
 
 服务名 `hpc-dashboard`，以你自己的用户身份运行（用你的 `~/.ssh/config` 和 key；系统服务
 拿不到桌面的 ssh-agent，所以 key 不能设密码）。看日志 `journalctl -u hpc-dashboard -f`，
@@ -276,6 +278,7 @@ PYTHON=/path/to/python ./install.sh           # 换一个 python
   - 同目录同时运行：好几个 job（不同的 job id，同一个 array 的 task 不算）同时 RUNNING
     在同一个目录里，一般是 dependency 没设对。这个只看 squeue，不用展开
   - 目录过大：读目录时 `du -sk` 的结果超过 `dir_size_warn_gb`（默认 30G）
+  - 文件过多：读过的目录里文件/子目录超过 `dir_files_warn` 个（默认 50）
   - 点 job id 跳过去，点路径复制
 
 ### 常见调整

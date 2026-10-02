@@ -42,6 +42,7 @@ from i18n import L, as_l, prefixed, suffixed
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.yaml")
+EXAMPLE_CONFIG_PATH = os.path.join(APP_DIR, "config.example.yaml")
 ASKPASS = os.path.join(APP_DIR, "ssh_askpass_abort.sh")
 CACHE_PATH = os.path.join(APP_DIR, ".dashboard_cache.json")
 INSPECT_CHUNK = 8  # 每次 SSH 看几个目录
@@ -109,7 +110,13 @@ PENDING = {"PENDING", "SUSPENDED", "REQUEUED", "REQUEUE_HOLD", "RESV_DEL_HOLD"}
 
 
 def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    """config.yaml 是你自己的配置（不进 git，用 install.py 生成）；没有的话先用示例配置跑起来"""
+    path = CONFIG_PATH
+    if not os.path.exists(path):
+        print("config.yaml not found, using config.example.yaml; run `python3 install.py` "
+              "to generate one / 没有 config.yaml，先用示例配置；运行 python3 install.py 生成")
+        path = EXAMPLE_CONFIG_PATH
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -651,7 +658,8 @@ class Backend:
                 "inspect": inspect,
                 "inspect_pending": pending,
                 "alerts": self.alerts(jobs),
-                "settings": {"dir_size_warn_gb": self.config.get("dir_size_warn_gb", 30)},
+                "settings": {"dir_size_warn_gb": self.config.get("dir_size_warn_gb", 30),
+                             "dir_files_warn": self.config.get("dir_files_warn", 50)},
             }))
 
     def inspect_view(self, jobs):
@@ -695,17 +703,24 @@ class Backend:
                 out.append({"type": "same_dir", "cluster": cluster, "dir": d,
                             "jobs": sorted(j["id"] for j in js),
                             "stale": any(j.get("stale") for j in js)})
-        # 2) 目录太大（只对读过的目录有数）
+        # 2) 目录太大 / 文件太多（只对读过的目录有数）
         limit_kb = self.config.get("dir_size_warn_gb", 30) * 1024 * 1024
+        limit_files = self.config.get("dir_files_warn", 50)
         by_dir = {}
         for j in jobs:
             if j.get("workdir"):
                 by_dir.setdefault(dir_key(j["cluster"], j["workdir"]), []).append(j["id"])
         for dk, ins in sorted(self.inspect_dirs.items()):
             size = ins.get("size_kb")
-            if size and size > limit_kb and dk in by_dir:
-                cluster, _, d = dk.partition("\u0000")
+            if dk not in by_dir:
+                continue
+            cluster, _, d = dk.partition("\u0000")
+            if size and size > limit_kb:
                 out.append({"type": "big_dir", "cluster": cluster, "dir": d, "size_kb": size,
+                            "jobs": sorted(by_dir[dk])})
+            count = ins.get("count")
+            if limit_files and count and count > limit_files:
+                out.append({"type": "many_files", "cluster": cluster, "dir": d, "count": count,
                             "jobs": sorted(by_dir[dk])})
         return out
 

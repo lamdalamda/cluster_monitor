@@ -58,6 +58,8 @@ inspect_files:
 inspect_tail_lines: 30
 # 读目录时顺便 du 一下大小，超过这么多 GB 就在界面顶部的"提醒"里报警
 dir_size_warn_gb: 30
+# 目录里的文件/子目录超过这么多个也报警（0 = 不报）
+dir_files_warn: 50
 # du 的超时（秒），lustre 上目录很大时 du 可能很慢；设 0 = 不查大小
 dir_size_timeout_seconds: 20
 
