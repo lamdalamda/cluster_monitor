@@ -1,9 +1,172 @@
 # HPC Job Dashboard
 
+[English](#english) · [中文](#中文)
+
+## English
+
+A small web page you run on your own workstation to see, as tables, your jobs on several
+Slurm clusters: their state, which nodes they run on, and how many you have running /
+pending in each QoS, so you can decide where to submit the next job.
+
+### How it works
+
+**The page is decoupled from SSH**: every remote operation goes into one background task
+queue and runs one after another; a progress bar at the top shows what the backend is
+doing. Opening the page shows the last data immediately (stored in `.dashboard_cache.json`,
+kept across restarts of app.py), without waiting for SSH. **No automatic refresh by
+default**: data is fetched when you click "Refresh"; set `auto_refresh_minutes` in
+config.yaml if you want it automatic.
+
+Each refresh runs **one SSH session per cluster** (clusters one after another) with:
+- `squeue --me -o ...`: your current pending/running jobs (QoS, dependencies, estimated start)
+- `sacct -X --starttime=now-Nhours ...`: jobs that finished in the last N hours
+- `squeue -t RUNNING,PENDING -o '%q|%T'` (all users): cluster-wide running/pending per QoS
+- `sacctmgr show assoc / show qos`: which QoS you can use and their limits
+  (rarely changes; queried every 30 minutes by default)
+- `squeue --all` + `sinfo`: the queue backlog estimate (logic from godot.py used on sulis,
+  see `backlog.py`); heavier, fetched at most every 5 minutes by default
+
+**This is plain `ssh <host> <command>`, not an API/REST connection**, so:
+- your machine must be able to log in to each login node with an SSH key (key + agent,
+  or a key without passphrase)
+- clusters with 2FA (sulis) work while the 2FA is still valid. The program **never** types
+  a code for you: as soon as the server actually prompts for input, `ssh_askpass_abort.sh`
+  kills ssh (nothing is sent, so no failed attempts pile up), the page shows "2FA needed"
+  and automatic retries pause for 10 minutes. Log in once with `ssh sulis` in a terminal,
+  then click "Refresh"
+- Host aliases, ProxyJump, jump hosts etc. from your `~/.ssh/config` are used
+
+### Install & run
+
+```bash
+cd cluster_monitor
+pip install -r requirements.txt
+
+# check that you can log in without a password first (no interactive password/2FA handling)
+ssh clusterA squeue --me
+
+# edit config.yaml: replace clusters with your own clusters and ssh aliases
+vim config.yaml
+
+python app.py
+```
+
+Then open `http://127.0.0.1:8787` (port set in config.yaml).
+
+### Wait-time data (waitlog/)
+
+Every refresh writes each job's requested resources, the cluster state when it was first
+seen pending (QoS queue counts, backlog estimate, Slurm's own estimated start, reason,
+priority) and how long it finally waited into `waitlog/jobs.csv`, and appends QoS /
+partition state snapshots. This is for building a wait-time prediction model later; the
+columns are described in [waitlog/README.md](waitlog/README.md).
+
+### Run as a systemd service (start on boot)
+
+```bash
+./install.sh                                  # sudo's itself; defaults to the pymatgen250508 python
+PYTHON=/path/to/python ./install.sh           # use another python
+./install.sh --uninstall                      # remove the service
+```
+
+The service is called `hpc-dashboard` and runs as your own user (using your
+`~/.ssh/config` and keys; a system service can't reach your desktop ssh-agent, so the keys
+must not have a passphrase). Logs: `journalctl -u hpc-dashboard -f`. After changing code or
+config.yaml: `sudo systemctl restart hpc-dashboard`. Stop any manually started
+`python app.py` first, or the port will clash.
+
+### The page
+
+**QoS panel** (one card per cluster)
+- Mine = your running / pending jobs in this QoS
+- Cluster = running / pending jobs of all users in this QoS; a long queue means it's busy.
+  Some clusters (e.g. with PrivateData) only show your own jobs in squeue; this column
+  then says "hidden"
+- MaxJobs / MaxSubmit / MaxWall / MaxTRES/user = per-user limits from sacctmgr; reaching
+  the running or submit cap is flagged as "run cap" / "submit cap"
+- Click a row to filter the job table to that QoS, click again to clear
+- The QoS list is discovered automatically (sacctmgr assoc); you can also list them under
+  each cluster in config.yaml (`qos:`), with optional notes
+
+**Queue backlog** (one card per cluster)
+- Per partition: cores, GPUs, CPU backlog, GPU backlog per GPU type. Backlog = sum of
+  (remaining time × cores/GPUs) over all jobs ÷ total cores/GPUs, i.e. "how long to clear
+  the current work if it packed perfectly"
+- Range Local – Global: the first only counts this partition, the second includes
+  partitions sharing the same nodes
+- GPU pools: how many cards of each type, shared by which partitions
+- Line cutters: other users' jobs submitted after your earliest pending job in the same
+  partition but already running (usually via backfill)
+- Clusters that hide other users' jobs (bluebear) can't be estimated; a one-line note says so
+
+**Job table**
+- Jobs with the **same name** on a cluster (usually one dependency chain, or repeated
+  submissions) share one row; `×N` is the count, click ▶ to see each one. The collapsed
+  row shows the "current" job: running > next pending > last one; the small tags count
+  the states in the group (R running, PD pending, CD completed, F failed, CA cancelled,
+  TO timeout…)
+- Order: groups with running jobs first, then pending, then finished
+- The "Dependencies" column shows e.g. `afterok #12345`; the dot is the state colour of
+  the job depended on, click it to jump there
+- For pending jobs the "Time" column shows Slurm's estimated start (`est.`) and a wait
+  range from the backlog (`backlog`, bottleneck resource; hover for CPU/GPU details). Jobs
+  stuck on limits like `AssocGrpJobsLimit` / `QOSMaxGRESPerUser` show "limit-blocked":
+  your own (or your group's) quota is full, regardless of how busy the cluster is
+- If a cluster is unreachable the last data stays visible (greyed out) and the card says
+  how old it is
+- Click a Job ID to copy it (handy for `scancel` or `--dependency=afterok:ID`)
+- Hover a name for full details (raw dependency string, submit/start/end times etc.)
+- Filter by cluster / QoS / state and search at the top; expanded rows and filters are
+  remembered in the browser
+- "Refresh" queues a refresh in the background and returns immediately; the data updates
+  when the progress bar finishes
+- Switch between English / 中文 at the top right (remembered in the browser)
+- **Expanding** a group (or a single job) makes the backend read each job's working folder
+  (squeue `%Z` / sacct `WorkDir`): `ls -lt`, then for each pattern in `inspect_files`
+  (default `vasp.out`, `Slab*.log`, slurm output `*{id}*.out*`) the newest matching file is
+  tailed + grepped. Each job gets an extra line: path (click to copy), number of files,
+  vasp.out ionic step / F / dE / electronic step, converged or not, last error; "Details"
+  shows the full `ls -lt` and tail. Results are cached; "Re-read" reads again. A folder
+  shared by several jobs is read once (each job only adds its own slurm output) and the
+  other jobs in that folder are listed
+- **Alerts** at the top:
+  - same folder: several jobs (different job ids; tasks of one array don't count) RUNNING
+    in the same folder at once, usually a wrong dependency. Based on squeue only, no need
+    to expand
+  - folder too large: `du -sk` of a read folder exceeds `dir_size_warn_gb` (default 30G)
+  - click a job id to jump to it, click a path to copy it
+
+### Common tweaks
+
+- **Only some clusters**: set `enabled: false` (or delete) the others in `config.yaml`.
+- **Automatic refresh**: `auto_refresh_minutes: 5` (SSH has a cost, don't go too low).
+- **More files**: add patterns to `inspect_files`, e.g. `OSZICAR`, `slurm-{id}.out`.
+- **Dependency history incomplete**: increase `history_hours` (sacct range); too large
+  makes each refresh slower.
+- **View from phone / other machines**: set `host` in `config.yaml` to `0.0.0.0` and use
+  your workstation's LAN IP. Anyone on that network can then see your job names, paths
+  and output files; restrict access with your firewall.
+- **SGE**: only Slurm (squeue/sacct) is supported; SGE `qstat` is not.
+
+### Known limitations
+
+- Dependencies are only resolved within one cluster (Slurm has no cross-cluster dependencies).
+- Slurm drops satisfied dependencies from squeue's `%E` and sacct doesn't record them, so a
+  started/finished job no longer shows what it depended on; this is why jobs are grouped by name.
+- Grouping is by name only: two jobs with different names aren't grouped even if one depends
+  on the other (the dependency column still shows and links it); conversely, unrelated jobs
+  with the same name are grouped.
+- Array job (`123_4`) dependencies are matched by the integer id; complex array dependency
+  expressions (on some indices only) aren't resolved per index.
+- No authentication. It listens on 127.0.0.1 by default; if you open it to 0.0.0.0, put it
+  behind a firewall rule, an SSH tunnel or a reverse proxy with authentication.
+
+## 中文
+
 在你自己的工作电脑上跑一个小网页，用表格看多个 Slurm 集群上你的作业状态、
 跑在哪个节点、每个 QoS 上你跑了/排了多少，方便决定下一个 job 往哪交。
 
-## 原理
+### 原理
 
 **网页和 SSH 是解耦的**：所有远程操作都放进一个后台任务队列，一个接一个执行，网页
 上方的进度条显示后台正在干什么。打开网页时直接显示上一次的数据（存在
@@ -27,10 +190,10 @@
   这时在终端里 `ssh sulis` 登录一次，再点网页上的"立即刷新"就好
 - 会用到你 `~/.ssh/config` 里已经配置好的 Host 别名、ProxyJump、跳板机等设置
 
-## 安装 & 运行
+### 安装 & 运行
 
 ```bash
-cd hpc-dashboard
+cd cluster_monitor
 pip install -r requirements.txt
 
 # 先测试一下你能不能免密连上（本程序不处理交互式密码/2FA）
@@ -44,14 +207,14 @@ python app.py
 
 然后浏览器打开 `http://127.0.0.1:8787`（端口见 config.yaml）。
 
-## 等待时间数据（waitlog/）
+### 等待时间数据（waitlog/）
 
 每次刷新会把每个 job 的请求资源、第一次看到它排队时的集群状态（QoS 排队数、积压估计、
 Slurm 自己的预计开始时间、原因、优先级）和最终等了多久写进 `waitlog/jobs.csv`，
 另外追加 QoS / 分区的状态快照。用来以后建一个预测等待时间的模型，列的含义见
 [waitlog/README.md](waitlog/README.md)。
 
-## 装成 systemd 服务（开机自启）
+### 装成 systemd 服务（开机自启）
 
 ```bash
 ./install.sh                                  # 会自己 sudo；默认用 pymatgen250508 那个 python
@@ -64,7 +227,7 @@ PYTHON=/path/to/python ./install.sh           # 换一个 python
 改了代码或 config.yaml 之后 `sudo systemctl restart hpc-dashboard`。装之前先把手动跑的
 `python app.py` 停掉，不然端口会冲突。
 
-## 界面说明
+### 界面说明
 
 **QoS 面板**（每个集群一张卡片）
 - 我的 = 你在这个 QoS 上 运行 / 排队 的 job 数
@@ -101,6 +264,7 @@ PYTHON=/path/to/python ./install.sh           # 换一个 python
 - 鼠标停在名字上能看到完整信息（原始 dependency 字符串、提交/开始/结束时间等）
 - 顶部可以按集群 / QoS / 状态筛选、搜索；展开状态和筛选条件会记在浏览器里
 - "立即刷新"把一次刷新放进后台队列，马上返回；进度条走完数据就更新了
+- 右上角可以切换中文 / English（记在浏览器里）
 - **展开**一组（或单个）job 时，后台会去读每个 job 的工作目录（squeue `%Z` / sacct
   `WorkDir`）：`ls -lt`，再对 `inspect_files` 里每个模式（默认 `vasp.out`、`Slab*.log`、
   slurm 输出文件 `*{id}*.out*`）取最新的匹配文件 tail + grep。每个 job 下面会多一行：
@@ -114,7 +278,7 @@ PYTHON=/path/to/python ./install.sh           # 换一个 python
   - 目录过大：读目录时 `du -sk` 的结果超过 `dir_size_warn_gb`（默认 30G）
   - 点 job id 跳过去，点路径复制
 
-## 常见调整
+### 常见调整
 
 - **只想看某几个集群**：在 `config.yaml` 里把不需要的集群 `enabled: false` 或删掉。
 - **想自动刷新**：`auto_refresh_minutes: 5`（SSH 有开销，别设太小）。
@@ -126,7 +290,7 @@ PYTHON=/path/to/python ./install.sh           # 换一个 python
   等信息，公司网络环境要自己权衡安全性。
 - **SGE**：这个工具目前只写了 Slurm 的 squeue/sacct 解析，SGE 的 `qstat` 不支持。
 
-## 已知限制
+### 已知限制
 
 - Dependency 目前只处理同一个集群内部的作业 id（Slurm 本身也不支持跨集群 dependency）。
 - Slurm 在依赖满足之后会把它从 squeue 的 `%E` 里去掉，sacct 也不记录 dependency，

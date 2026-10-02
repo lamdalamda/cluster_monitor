@@ -38,6 +38,7 @@ from flask import Flask, jsonify, render_template, request
 import backlog
 import jobfiles
 import waitlog
+from i18n import L, as_l, prefixed, suffixed
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.yaml")
@@ -416,7 +417,7 @@ class Backend:
             if any(t["kind"] == "refresh" for t in self.queue):
                 return False  # 已经排着一个刷新了
             n = len(self.clusters())
-            self._enqueue({"kind": "refresh", "label": "刷新作业状态", "steps": n, "force": force})
+            self._enqueue({"kind": "refresh", "label": L("刷新作业状态", "Refreshing job status"), "steps": n, "force": force})
             return True
 
     def _jobs_of(self, cluster):
@@ -435,7 +436,9 @@ class Backend:
                 d = self._jobs_of(cluster).get(jid, {}).get("workdir", "")
                 if not d:
                     self.inspect_job_err[key] = {
-                        "error": "没有工作目录信息（squeue/sacct 里没查到 WorkDir）", "at": now_iso()}
+                        "error": L("没有工作目录信息（squeue/sacct 里没查到 WorkDir）",
+                                   "No working directory known (no WorkDir from squeue/sacct)"),
+                        "at": now_iso()}
                     changed = True
                     continue
                 dk = dir_key(cluster, d)
@@ -449,7 +452,8 @@ class Backend:
                     chunk = dirs[i:i + INSPECT_CHUNK]
                     self.inspect_pending.update(dir_key(cluster, d) for d in chunk)
                     self._enqueue({"kind": "inspect", "cluster": cluster, "dirs": chunk,
-                                   "label": f"查看 {cluster} 上 {len(chunk)} 个目录",
+                                   "label": L(f"查看 {cluster} 上 {len(chunk)} 个目录",
+                                              f"Reading {len(chunk)} folder(s) on {cluster}"),
                                    "steps": 1})
                     added += len(chunk)
             if changed and not added:
@@ -470,7 +474,8 @@ class Backend:
                     self.run_inspect(task)
             except Exception as e:  # noqa: BLE001
                 with self.lock:
-                    self.results.setdefault("_errors", {})["worker"] = f"后台任务出错: {e}"
+                    self.results.setdefault("_errors", {})["worker"] = L(f"后台任务出错: {e}",
+                                                                      f"Background task failed: {e}")
             finally:
                 with self.lock:
                     self.current = None
@@ -493,7 +498,8 @@ class Backend:
     def run_refresh(self, task):
         clusters = self.clusters()
         for i, c in enumerate(clusters, 1):
-            self._step(f"刷新 {c['name']}（{i}/{len(clusters)}）")
+            self._step(L(f"刷新 {c['name']}（{i}/{len(clusters)}）",
+                         f"Refreshing {c['name']} ({i}/{len(clusters)})"))
             r = self.poll_cluster(c, task.get("force", True))
             with self.lock:
                 self.store_result(r)
@@ -504,7 +510,8 @@ class Backend:
                         self.results.get("_errors", {}).pop("waitlog", None)
                 except Exception as e:  # noqa: BLE001  记录失败不影响刷新
                     with self.lock:
-                        self.results.setdefault("_errors", {})["waitlog"] = f"写 waitlog 出错: {e}"
+                        self.results.setdefault("_errors", {})["waitlog"] = L(
+                            f"写 waitlog 出错: {e}", f"Failed to write waitlog: {e}")
             self._step_done()
             self.save_cache()
         with self.lock:
@@ -545,9 +552,10 @@ class Backend:
             results = {}
             blocked = self.auth_blocked.get(cluster)
             if not c:
-                err = "集群已经不在 config 里了"
+                err = L("集群已经不在 config 里了", "Cluster is no longer in config")
             elif blocked and time.time() < blocked["until"]:
-                err = "集群需要 2FA，先在终端登录一次再试"
+                err = L("集群需要 2FA，先在终端登录一次再试",
+                        "Cluster needs 2FA: log in once in a terminal, then retry")
             else:
                 du_timeout = cfg.get("dir_size_timeout_seconds", 20)
                 cmd = jobfiles.build_cmd(
@@ -557,14 +565,15 @@ class Backend:
                 try:
                     ok, out, err = run_ssh(c["ssh_host"], cmd, timeout)
                 except NeedInput as e:
-                    ok, out, err = False, "", f"需要交互输入（2FA/密码）：{e}"
+                    ok, out, err = False, "", L(f"需要交互输入（2FA/密码）：{e}",
+                                                f"Interactive input required (2FA/password): {e}")
                 if ok:
                     parsed = jobfiles.parse_output(out)
                     for n, (d, _) in enumerate(plan):
-                        results[d] = parsed.get(n) or {"error": "没拿到输出"}
+                        results[d] = parsed.get(n) or {"error": L("没拿到输出", "No output")}
                     err = None
                 else:
-                    err = err or "ssh 失败"
+                    err = err or L("ssh 失败", "ssh failed")
             with self.lock:
                 for d in dirs:
                     res = results.get(d) or {"error": err}
@@ -617,19 +626,20 @@ class Backend:
                                      "backlog": None, "at": None, "never": True})
                     continue
                 if not r["ok"]:
-                    errors.append(f"{name}: {r['error']}")
-                errors.extend(f"{name}: {w}" for w in r.get("warnings", []))
+                    errors.append(prefixed(f"{name}: ", r["error"]))
+                errors.extend(prefixed(f"{name}: ", w) for w in r.get("warnings", []))
                 stale = bool(r.get("stale_since"))
                 for j in r.get("jobs", {}).values():
                     jobs.append({**j, "stale": stale})
                 clusters.append({
-                    "name": name, "ok": r["ok"], "error": r.get("error"),
+                    "name": name, "ok": r["ok"],
+                    "error": as_l(r["error"]) if r.get("error") else None,
                     "need_input": r.get("need_input", False),
                     "stale_since": r.get("stale_since"), "at": r.get("at"),
                     "load_private": r.get("load_private", False), "qos": r.get("qos", []),
                     "backlog": r.get("backlog"),
                 })
-            errors.extend(self.results.get("_errors", {}).values())
+            errors.extend(as_l(e) for e in self.results.get("_errors", {}).values())
             inspect, pending = self.inspect_view(jobs)
             return json.loads(json.dumps({
                 "version": self.version,
@@ -707,7 +717,8 @@ class Backend:
         if blocked and not force and now < blocked["until"]:
             retry = datetime.fromtimestamp(blocked["until"]).strftime("%H:%M")
             return {"name": name, "ok": False, "need_input": True,
-                    "error": f"{blocked['error']}（{retry} 自动重试，或登录后点立即刷新）",
+                    "error": suffixed(blocked["error"], f"（{retry} 自动重试，或登录后点立即刷新）",
+                                      f" (auto retry at {retry}, or log in and click Refresh)"),
                     "warnings": [], "jobs": {}, "qos": []}
 
         timeout = cfg.get("ssh_timeout_seconds", 15)
@@ -741,7 +752,9 @@ class Backend:
         try:
             ok, out, err = run_ssh(c["ssh_host"], build_remote_cmd(steps), timeout_total)
         except NeedInput as e:
-            msg = f"需要交互输入（2FA/密码）：{e}。请先在终端里手动 ssh {c['ssh_host']} 登录一次"
+            msg = L(f"需要交互输入（2FA/密码）：{e}。请先在终端里手动 ssh {c['ssh_host']} 登录一次",
+                    f"Interactive input required (2FA/password): {e}. "
+                    f"Log in once with `ssh {c['ssh_host']}` in a terminal")
             self.auth_blocked[name] = {
                 "until": now + cfg.get("auth_retry_minutes", 10) * 60, "error": msg}
             return {"name": name, "ok": False, "need_input": True, "error": msg,
@@ -754,11 +767,11 @@ class Backend:
         sections, failed = split_sections(out)
         warnings = []
         if "END" not in sections or {"SQUEUE", "SACCT"} <= failed:
-            return {"name": name, "ok": False, "error": err[-300:] or "squeue/sacct 都失败了",
+            return {"name": name, "ok": False, "error": err[-300:] or L("squeue/sacct 都失败了", "Both squeue and sacct failed"),
                     "warnings": [], "jobs": {}, "qos": []}
         for sec in sorted(failed):
             if not sec.startswith("BL_"):  # 积压分析失败会在积压面板里说明，这里不重复报
-                warnings.append(f"{sec.lower()} 命令失败")
+                warnings.append(L(f"{sec.lower()} 命令失败", f"{sec.lower()} command failed"))
 
         hist = parse_sacct(sections.get("SACCT", []), name)
         active = parse_squeue(sections.get("SQUEUE", []), name)
@@ -791,7 +804,8 @@ class Backend:
             try:
                 result, model = backlog.analyze(sections, me)
             except Exception as e:  # noqa: BLE001
-                result, model = {"ok": False, "error": f"积压分析出错: {e}"}, None
+                result, model = {"ok": False, "error": L(f"积压分析出错: {e}",
+                                                       f"Backlog analysis failed: {e}")}, None
             result["fetched_at"] = datetime.now(timezone.utc).isoformat()
             bl_cached = {"result": result, "model": model, "fetched_at": now}
             self.backlog[name] = bl_cached

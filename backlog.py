@@ -13,6 +13,8 @@
 
 import re
 
+from i18n import L
+
 DEFAULT_TIMELIMIT_HOURS = 24.0
 
 # 拼进 app.py 那次 SSH 里的命令
@@ -100,7 +102,8 @@ def analyze(sections, me):
                 pass
 
     if not caps:
-        return {"ok": False, "error": "sinfo 看不到分区信息，没法估计"}, None
+        return {"ok": False, "error": L("sinfo 看不到分区信息，没法估计",
+                                        "sinfo shows no partitions, can't estimate")}, None
 
     # ---- 作业 ----
     jobs = []
@@ -125,7 +128,8 @@ def analyze(sections, me):
     users = {j["user"] for j in jobs}
     if jobs and users <= {me}:
         return {"ok": False, "private": True,
-                "error": "这个集群的 squeue 只能看到你自己的 job，没法估计别人占了多少"}, None
+                "error": L("这个集群的 squeue 只能看到你自己的 job，没法估计别人占了多少",
+                           "squeue only shows your own jobs here, can't estimate others' load")}, None
 
     def gpu_types_for(part, gtype):
         if gtype and gtype in pools:
@@ -184,16 +188,17 @@ def analyze(sections, me):
             continue
         p = j["parts"][0]
         if p in my_first_pending and j["id_num"] > my_first_pending[p]:
-            reasons = []
+            reasons = []  # (中文, English)
             if j["limit_h"] < 4.0:
-                reasons.append("时间短")
+                reasons.append(("时间短", "short time limit"))
             if j["gpus"] == 0:
-                reasons.append("只要 CPU")
+                reasons.append(("只要 CPU", "CPU only"))
             elif j["gpus"] == 1:
-                reasons.append("只要 1 卡")
+                reasons.append(("只要 1 卡", "single GPU"))
             cutters.append({
                 "id": j["id"], "partition": p, "account": j["account"], "cpus": j["cpus"],
-                "gpus": j["gpus"], "limit": j["limit"], "reason": "、".join(reasons) or "Backfill",
+                "gpus": j["gpus"], "limit": j["limit"], "reason": L("、".join(r[0] for r in reasons) or "Backfill",
+                                                      ", ".join(r[1] for r in reasons) or "Backfill"),
             })
     cutters.sort(key=lambda c: -base_id(c["id"]))
 
