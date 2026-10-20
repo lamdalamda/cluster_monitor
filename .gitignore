@@ -1,0 +1,9 @@
+config.yaml
+config.yaml.bak.*
+.dashboard_cache.json
+.dashboard_cache.json.tmp
+__pycache__/
+*.bak
+waitlog/*.csv
+waitlog/*.old
+waitlog/*.tmp
