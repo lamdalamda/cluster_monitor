@@ -7,7 +7,9 @@
 - 对 config.yaml 里 inspect_files 的每个模式（默认 vasp.out、Slab*.log、*{id}*.out*），
   取最新的那个匹配文件：tail 最后几行 + grep 一下关键行（离子步、收敛、报错）。
   带 {id} 的模式对这个目录里的每个 job 各找一次（每个 job 自己的 slurm 输出）。
-然后在本地解析成摘要（离子步数、能量、是否收敛、最后一条报错）。
+- 目录里有 OUTCAR 的话，只看它最后几 MB 里的 LOOP 行（每个电子步 / 离子步的 cpu time 和
+  real time）：real 比 cpu 大很多说明在等通信 / IO（节点有问题、跨节点太慢），单步太久也报警。
+然后在本地解析成摘要（离子步数、能量、是否收敛、最后一条报错、LOOP 时间）。
 """
 
 import re
@@ -29,10 +31,12 @@ ERROR_RE = re.compile(
     r"VERY BAD NEWS|ZBRENT: fatal|EDDDAV|BRMIX: very serious|[Ee]rror|ERROR|Traceback|"
     r"BAD TERMINATION|[Kk]illed|DUE TO TIME LIMIT|CANCELLED"
 )
+LOOP_RE = re.compile(r"LOOP(\+?):\s+cpu time\s+([-+.\dEe]+):\s+real time\s+([-+.\dEe]+)")
+LOOP_TAIL_BYTES = 5_000_000  # OUTCAR 可能有好几 GB，只看结尾
 LS_RE = re.compile(r"^([-dlcbps])\S*\s+\d+\s+\S+\s+\S+\s+(\d+)\s+(\S+)\s+(.+)$")
 
 
-def build_cmd(dirs, patterns, tail_lines=30, ls_lines=40, du_timeout=20):
+def build_cmd(dirs, patterns, tail_lines=30, ls_lines=40, du_timeout=20, loop_file="OUTCAR"):
     """dirs: [(workdir, [jobid, ...])]。每个目录放在子 shell 里，cd 失败不影响后面的。
     输出里目录用序号 @@DIR <n> 标记（不用路径，免得路径里有奇怪字符）。"""
 
@@ -57,6 +61,10 @@ def build_cmd(dirs, patterns, tail_lines=30, ls_lines=40, du_timeout=20):
                 file_cmds.append(one_file(pat, ""))
         du = (f"echo \"@@DU $(timeout {int(du_timeout)} du -sk . 2>/dev/null | cut -f1)\"; "
               if du_timeout else "")
+        if loop_file:
+            q = shlex.quote(loop_file)
+            file_cmds.append(f"if [ -f {q} ]; then echo @@LOOP; tail -c {LOOP_TAIL_BYTES} -- {q} "
+                             f"| grep -a 'LOOP' | tail -n 6; fi")
         parts.append(
             f"echo '@@DIR {n}'; ( if cd -- {shlex.quote(workdir)} 2>/dev/null; then "
             f"echo \"@@COUNT $(ls -1A | wc -l)\"; {du}echo @@LS; "
@@ -66,6 +74,25 @@ def build_cmd(dirs, patterns, tail_lines=30, ls_lines=40, du_timeout=20):
         )
     parts.append("echo @@END")
     return "; ".join(parts)
+
+
+def loop_warning(loop, cfg):
+    """最新一个电子步（LOOP:）的时间要不要报警。返回原因（{zh, en}）或 None。
+    real > ratio × cpu 且 real > cpu + extra 秒：在等通信 / IO；real > max 秒：单步太慢"""
+    e = (loop or {}).get("elec")
+    if not e or e["cpu"] is None or e["real"] is None:
+        return None
+    cpu, real = e["cpu"], e["real"]
+    ratio = cfg.get("loop_warn_ratio", 1.1)
+    extra = cfg.get("loop_warn_extra_seconds", 5)
+    max_real = cfg.get("loop_warn_real_seconds", 1000)
+    if real > ratio * cpu and real > cpu + extra:
+        return {"zh": f"real time {real:.0f}s 比 cpu time {cpu:.0f}s 大很多（> {ratio}× 且 > +{extra}s）",
+                "en": f"real time {real:.0f}s well above cpu time {cpu:.0f}s (> {ratio}x and > +{extra}s)"}
+    if max_real and real > max_real:
+        return {"zh": f"单个电子步 real time {real:.0f}s > {max_real}s",
+                "en": f"one electronic step took {real:.0f}s real time (> {max_real}s)"}
+    return None
 
 
 def _num(s):
@@ -146,6 +173,15 @@ def parse_output(output):
             continue
         if s == "@@GREP":
             section = "grep"
+            continue
+        if s == "@@LOOP":
+            section = "loop"
+            continue
+        if section == "loop":
+            m = LOOP_RE.search(s)
+            if m:
+                key = "ionic" if m.group(1) else "elec"
+                cur.setdefault("loop", {})[key] = {"cpu": _num(m.group(2)), "real": _num(m.group(3))}
             continue
         if section == "ls":
             m = LS_RE.match(s)

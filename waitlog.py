@@ -16,7 +16,9 @@
 import csv
 import os
 import re
-from datetime import datetime, timezone
+import tarfile
+import threading
+from datetime import datetime, timedelta, timezone
 
 import backlog
 
@@ -96,6 +98,7 @@ class WaitLog:
         self.qos_path = os.path.join(directory, "qos_snapshots.csv")
         self.part_path = os.path.join(directory, "partition_snapshots.csv")
         self.rows = {}  # (cluster, jobid) -> row dict
+        self.lock = threading.Lock()  # update() 在后台线程跑，history() 在网页请求里读
         self.last_backlog_at = {}  # cluster -> 上次写过的积压数据时间，避免重复写
         os.makedirs(directory, exist_ok=True)
         self._load()
@@ -153,24 +156,23 @@ class WaitLog:
         except ValueError:
             bl_at = None
         load_private = result.get("load_private")
-
-        for jid, j in result.get("jobs", {}).items():
-            if "[" in jid:  # 还没展开的 array 排队记录（123_[1-10]），等各个 task 出现再记
-                continue
-            key = (cluster, jid)
-            row = self.rows.get(key)
-            if row is None:
-                row = {"cluster": cluster, "jobid": jid, "first_seen_at": now_s, "seen_pending": "0"}
-                self.rows[key] = row
-            self._fill_static(row, j)
-            row["last_seen_at"] = now_s
-            if j["state"] in PENDING and row.get("seen_pending") != "1" and j.get("source") == "squeue":
-                row["seen_pending"] = "1"
-                self._fill_obs(row, j, now, qos_rows.get(j.get("qos")), bl_parts, bl_at,
-                               load_private)
-            self._fill_outcome(row, j, now_s)
-
-        self._write_jobs()
+        with self.lock:
+            for jid, j in result.get("jobs", {}).items():
+                if "[" in jid:  # 还没展开的 array 排队记录（123_[1-10]），等各个 task 出现再记
+                    continue
+                key = (cluster, jid)
+                row = self.rows.get(key)
+                if row is None:
+                    row = {"cluster": cluster, "jobid": jid, "first_seen_at": now_s, "seen_pending": "0"}
+                    self.rows[key] = row
+                self._fill_static(row, j)
+                row["last_seen_at"] = now_s
+                if j["state"] in PENDING and row.get("seen_pending") != "1" and is_live(j):
+                    row["seen_pending"] = "1"
+                    self._fill_obs(row, j, now, qos_rows.get(j.get("qos")), bl_parts, bl_at,
+                                   load_private)
+                self._fill_outcome(row, j, now_s)
+            self._write_jobs()
         self._append(self.qos_path, QOS_COLUMNS, [{
             "observed_at": now_s, "cluster": cluster, "qos": q["name"],
             "all_running": "" if q.get("all_running") is None else q["all_running"],
@@ -250,7 +252,7 @@ class WaitLog:
         row["state"] = state
         # 排队中的 job，squeue 的 start 是"预计"开始时间，不能当真实开始；
         # 排队时被取消的 job，有的 Slurm 版本会把 Start 设成取消时间，所以还要求分到过节点
-        started = state in ACTIVE or (state not in PENDING and j.get("source") == "sacct"
+        started = state in ACTIVE or (state not in PENDING and not is_live(j)
                                       and parse_ts(j.get("start")) and j.get("nodelist"))
         if started and j.get("start"):
             row["start"] = j["start"]
@@ -268,3 +270,178 @@ class WaitLog:
         row["wait_from_submit_h"] = hours_between(row.get("submit"), end_ref)
         row["wait_from_eligible_h"] = hours_between(row.get("eligible") or row.get("submit"),
                                                     end_ref)
+
+    # ---------------- 网页上的"排队历史" ----------------
+    def history(self, days=None, cluster="", qos="", search="", limit=300, now=None):
+        """按 集群 × QoS 统计已经开始的 job 等了多久，再列出最近的 job。
+        days: 只看最近几天开始的（没开始的看 结束/可以排队/提交 时间；None = 全部）；qos = "集群|QoS"，只筛下面的 job 列表，
+        统计表总是全部 QoS"""
+        now = now or datetime.now()
+        since = now - timedelta(days=days) if days else None
+        needle = search.lower()
+        with self.lock:
+            rows = [dict(r) for r in self.rows.values()]
+        picked = []
+        for r in rows:
+            # 按"最近一次有动静"的时间算：依赖链里的 job 常常很早提交、很晚才开始
+            t = next((x for x in map(parse_ts, (r.get("start"), r.get("end"), r.get("eligible"),
+                                                 r.get("submit"), r.get("first_seen_at"))) if x), None)
+            if since and (not t or t < since):
+                continue
+            if cluster and r.get("cluster") != cluster:
+                continue
+            if needle and needle not in " ".join(r.get(k) or "" for k in (
+                    "cluster", "jobid", "name", "qos", "partition", "run_partition", "nodelist",
+                    "state", "gpu_type")).lower():
+                continue
+            picked.append((t or datetime.min, r))
+
+        groups = {}
+        for _, r in picked:
+            g = groups.setdefault((r.get("cluster", ""), r.get("qos", "")), {"waits": [], "pending": 0, "no_start": 0})
+            w = to_float(r.get("wait_from_eligible_h"))
+            if r.get("censored") == "0" and w is not None:
+                g["waits"].append(max(w, 0.0))
+            elif r.get("state") in PENDING:
+                g["pending"] += 1
+            else:
+                g["no_start"] += 1  # 排队时被取消 / 没观察到开始
+        stats = []
+        for (c, q), g in sorted(groups.items()):
+            ws = sorted(g["waits"])
+            stats.append({"cluster": c, "qos": q, "started": len(ws), "pending": g["pending"],
+                          "no_start": g["no_start"],
+                          "p25": quantile(ws, .25), "median": quantile(ws, .5),
+                          "p75": quantile(ws, .75), "p90": quantile(ws, .9),
+                          "max": ws[-1] if ws else None})
+
+        q_cluster, _, q_name = qos.partition("|")
+        jobs = [r for _, r in sorted(picked, key=lambda x: x[0], reverse=True)
+                if not qos or (r.get("cluster") == q_cluster and (r.get("qos") or "") == q_name)]
+        out = [{
+            "cluster": r.get("cluster"), "jobid": r.get("jobid"), "name": r.get("name"),
+            "qos": r.get("qos"), "partition": r.get("run_partition") or r.get("partition"),
+            "cpus": r.get("cpus"), "gpus": r.get("gpus"), "gpu_type": r.get("gpu_type"),
+            "nodelist": r.get("nodelist"), "state": r.get("state"),
+            "submit": r.get("submit"), "eligible": r.get("eligible"),
+            "start": r.get("start"), "end": r.get("end"),
+            "wait_h": to_float(r.get("wait_from_eligible_h")),
+            "wait_submit_h": to_float(r.get("wait_from_submit_h")),
+            "censored": r.get("censored") != "0",
+        } for r in jobs[:limit]]
+        return {"stats": stats, "jobs": out, "total": len(jobs)}
+
+
+def is_live(j):
+    """这条记录来自当前队列（squeue / qstat），而不是历史记录（sacct / accounting）"""
+    return j.get("live", j.get("source") == "squeue")
+
+
+def to_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def quantile(sorted_vals, q):
+    if not sorted_vals:
+        return None
+    pos = (len(sorted_vals) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    return round(sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (pos - lo), 3)
+
+
+# ---------------- 大小上限 / 定期备份 ----------------
+BACKUP_RE = re.compile(r"^waitlog-(\d{8}-\d{6})\.tar\.gz$")
+
+
+def dir_size(path):
+    """目录下所有文件的总字节数"""
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def list_backups(backup_dir):
+    """[(备份时间, 路径), ...]，旧的在前"""
+    out = []
+    try:
+        names = os.listdir(backup_dir)
+    except OSError:
+        return out
+    for n in names:
+        m = BACKUP_RE.match(n)
+        if m:
+            out.append((datetime.strptime(m.group(1), "%Y%m%d-%H%M%S"), os.path.join(backup_dir, n)))
+    return sorted(out)
+
+
+def latest_mtime(path):
+    newest = 0.0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                newest = max(newest, os.path.getmtime(os.path.join(root, f)))
+            except OSError:
+                pass
+    return newest
+
+
+def backup_due(src, backup_dir, days, now=None):
+    """最新的备份已经超过 days 天（或者还没有备份）就该备份了"""
+    if not days or days <= 0 or not os.path.isdir(src):
+        return False
+    now = now or datetime.now()
+    backups = list_backups(backup_dir)
+    if not backups:
+        return latest_mtime(src) > 0  # 空目录不备份
+    last_at = backups[-1][0]
+    if now - last_at < timedelta(days=days):
+        return False
+    # 上次备份之后什么都没改过（比如超过大小上限停写了），不用再打一份一模一样的
+    return latest_mtime(src) > last_at.timestamp()
+
+
+def make_backup(src, backup_dir, keep=10, now=None):
+    """把 src 打包成 backup_dir/waitlog-YYYYmmdd-HHMMSS.tar.gz，只留最新的 keep 份"""
+    now = now or datetime.now()
+    os.makedirs(backup_dir, exist_ok=True)
+    path = os.path.join(backup_dir, f"waitlog-{now:%Y%m%d-%H%M%S}.tar.gz")
+    tmp = path + ".tmp"
+    skip = os.path.abspath(backup_dir) + os.sep
+
+    def keep_member(ti):
+        return None if ti.name.endswith(".tmp") else ti
+
+    try:
+        with tarfile.open(tmp, "w:gz") as tar:
+            for root, dirs, files in os.walk(src):
+                # 备份目录要是放在 waitlog 里面，别把旧备份也打进去
+                dirs[:] = [d for d in dirs if not (os.path.abspath(os.path.join(root, d)) + os.sep).startswith(skip)]
+                for f in sorted(files):
+                    full = os.path.join(root, f)
+                    arc = os.path.join(os.path.basename(os.path.abspath(src)), os.path.relpath(full, src))
+                    tar.add(full, arcname=arc, filter=keep_member)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    removed = []
+    if keep and keep > 0:
+        for _, old in list_backups(backup_dir)[:-keep]:
+            try:
+                os.remove(old)
+                removed.append(old)
+            except OSError:
+                pass
+    return path, removed

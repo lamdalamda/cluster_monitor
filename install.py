@@ -43,11 +43,12 @@ MSG = {
     "cfg_exists": ("已经有 config.yaml 了。[k] 保留  [r] 重新生成（旧的会备份）", "config.yaml already exists. [k] keep  [r] regenerate (old one is backed up)"),
     "ssh_read": ("读取 ~/.ssh/config 里的 Host 来选集群吗？", "Read Host entries from ~/.ssh/config to pick clusters?"),
     "ssh_none": ("~/.ssh/config 里没找到具体的 Host。", "No concrete Host entries found in ~/.ssh/config."),
-    "probe_q": ("挨个 ssh 上去测试哪些 Host 有 Slurm 吗？（只跑 `command -v sbatch`；需要 2FA 的不会替你输入，直接跳过）",
-                "SSH to each Host to test which have Slurm? (runs only `command -v sbatch`; hosts asking for 2FA are skipped, nothing is typed)"),
+    "probe_q": ("挨个 ssh 上去测试哪些 Host 有 Slurm / SGE 吗？（只跑 `command -v sbatch` / `qstat -help`；需要 2FA 的不会替你输入，直接跳过）",
+                "SSH to each Host to test which have Slurm / SGE? (runs only `command -v sbatch` / `qstat -help`; hosts asking for 2FA are skipped, nothing is typed)"),
     "probing": ("正在测试 {n} 个 Host…", "Testing {n} hosts…"),
     "st_slurm": ("Slurm ✓", "Slurm ✓"),
-    "st_noslurm": ("没有 Slurm", "no Slurm"),
+    "st_sge": ("SGE ✓", "SGE ✓"),
+    "st_noslurm": ("没有 Slurm / SGE", "no Slurm / SGE"),
     "st_2fa": ("需要 2FA/密码", "needs 2FA/password"),
     "st_down": ("连不上", "unreachable"),
     "pick": ("选要监控的集群：编号用逗号/范围（如 1,3,5-7），all = 全部，回车 = 默认 [{d}]",
@@ -200,7 +201,10 @@ def probe(alias):
     try:
         p = subprocess.run(
             ["ssh", "-o", "BatchMode=no", "-o", "KbdInteractiveAuthentication=yes",
-             "-o", "ConnectTimeout=8", alias, "command -v sbatch >/dev/null && echo @@SLURM_OK"],
+             "-o", "ConnectTimeout=8", alias,
+             "if command -v sbatch >/dev/null; then echo @@SLURM_OK; "
+             "elif command -v qstat >/dev/null && qstat -help 2>&1 | head -n 1 | grep -qE '^(SGE|GE|OGS|SoGE|UGE)'; "
+             "then echo @@SGE_OK; fi"],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=25, env=env,
             start_new_session=True)
     except (OSError, subprocess.TimeoutExpired):
@@ -209,6 +213,8 @@ def probe(alias):
         return "2fa"
     if "@@SLURM_OK" in p.stdout:
         return "slurm"
+    if "@@SGE_OK" in p.stdout:
+        return "sge"
     return "down" if p.returncode == 255 or p.returncode < 0 else "noslurm"
 
 
@@ -239,7 +245,7 @@ def existing_cluster_hosts():
 
 
 def choose_clusters():
-    chosen = []
+    chosen, status = [], {}
     if yes(m("ssh_read")):
         hosts = parse_ssh_config("~/.ssh/config")
         if not hosts:
@@ -257,7 +263,7 @@ def choose_clusters():
                 st = m("st_" + status[h]) if h in status else ""
                 print(f"  [{i:>2}] {h:<18} {targets.get(h, ''):<40} {st}")
             default = [i for i, h in enumerate(hosts, 1)
-                       if status.get(h) == "slurm" or (not status and h in before)
+                       if status.get(h) in ("slurm", "sge") or (not status and h in before)
                        or (status.get(h) == "2fa" and h in before)]
             dtext = ",".join(map(str, default))
             while True:
@@ -277,7 +283,7 @@ def choose_clusters():
     if not yes(m("names_q")):
         for h in chosen:
             names[h] = ask(m("name_for", h=h), h)
-    return [(names[h], h) for h in chosen]
+    return [(names[h], h, status.get(h) if status.get(h) == "sge" else None) for h in chosen]
 
 
 # ---------------- config.yaml ----------------
@@ -295,8 +301,10 @@ def render_config(template, clusters, values):
     start = next(i for i, l in enumerate(lines) if l.startswith("clusters:"))
     end = next(i for i in range(start + 1, len(lines)) if lines[i] and not lines[i][0].isspace())
     block = ["clusters:"]
-    for k, (name, host) in enumerate(clusters):
+    for k, (name, host, sched) in enumerate(clusters):
         block += [f"  - name: {yaml_scalar(name)}", f"    ssh_host: {yaml_scalar(host)}", "    enabled: true"]
+        if sched:
+            block += [f"    scheduler: {sched}"]
         if k == 0:
             block += ["    # qos:            # 可选 / optional", "    #   - freecpu",
                       "    #   - name: freegpu", "    #     note: GPU, max 2 days"]
@@ -329,8 +337,8 @@ def make_config():
         "waitlog": yes(m("waitlog_q")),
     }
     title(m("preview"))
-    for name, host in clusters:
-        print(f"  - {name} ({host})")
+    for name, host, sched in clusters:
+        print(f"  - {name} ({host}{', ' + sched if sched else ''})")
     for k, v in values.items():
         print(f"  {k}: {yaml_scalar(v)}")
     if not yes(m("write_q")):
@@ -345,7 +353,7 @@ def make_config():
     with open(CONFIG, "w", encoding="utf-8") as f:
         f.write(text)
     print(m("written", p=CONFIG))
-    return values, [h for _, h in clusters]
+    return values, [h for _, h, _ in clusters]
 
 
 def read_values():

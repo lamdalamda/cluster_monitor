@@ -5,7 +5,7 @@
 ## English
 
 A small web page you run on your own workstation to see, as tables, your jobs on several
-Slurm clusters: their state, which nodes they run on, and how many you have running /
+Slurm and SGE (Son of Grid Engine) clusters: their state, which nodes they run on, and how many you have running /
 pending in each QoS, so you can decide where to submit the next job.
 
 ### How it works
@@ -65,6 +65,18 @@ seen pending (QoS queue counts, backlog estimate, Slurm's own estimated start, r
 priority) and how long it finally waited into `waitlog/jobs.csv`, and appends QoS /
 partition state snapshots. This is for building a wait-time prediction model later; the
 columns are described in [waitlog/README.md](waitlog/README.md).
+
+The "Queue history" section at the bottom of the page (collapsed by default) reads this
+file: per cluster × QoS, how many jobs started and their median / P25–P75 / P90 / max wait
+(start − eligible), plus a searchable list of past jobs with submit / start / end times.
+
+- **Size limit**: when the `waitlog/` folder grows past `waitlog_max_mb` (default 500 MB)
+  nothing more is written to it and the page shows an alert.
+- **Backups**: when you click "Refresh" and the newest backup is older than
+  `waitlog_backup_days` (default 7) days, `waitlog/` is packed into
+  `waitlog_backups/waitlog-YYYYmmdd-HHMMSS.tar.gz`; only the newest `waitlog_backup_keep`
+  (default 10) are kept. Automatic refreshes never make a backup, and no new backup is made
+  if nothing changed since the last one.
 
 ### Run as a systemd service (start on boot)
 
@@ -137,7 +149,34 @@ config.yaml: `sudo systemctl restart hpc-dashboard`. Stop any manually started
     to expand
   - folder too large: `du -sk` of a read folder exceeds `dir_size_warn_gb` (default 30G)
   - too many files: a read folder has more than `dir_files_warn` entries (default 50)
+  - slow LOOP: the folder has an `OUTCAR` (only its last 5 MB is grepped for `LOOP`); the
+    latest electronic step's cpu / real time is shown next to the ionic step, and a still
+    running job is flagged when real > 1.1 × cpu **and** real > cpu + 5 s (waiting on
+    communication / IO), or real > 1000 s. Thresholds: `loop_warn_ratio`,
+    `loop_warn_extra_seconds`, `loop_warn_real_seconds`
   - click a job id to jump to it, click a path to copy it
+
+### Schedulers (Slurm / SGE)
+
+Each cluster in `config.yaml` can set `scheduler: slurm` (default) or `scheduler: sge`.
+Every scheduler is a subclass of `schedulers/base.py:Scheduler` (`schedulers/slurm.py`,
+`schedulers/sge.py`) that says which commands to run, how to parse them, and which
+**features** it supports; the page only shows what a cluster supports:
+
+| feature | Slurm | SGE |
+|---|---|---|
+| your jobs | squeue | `qstat -u $USER -r -xml` + `qstat -j` (project, folder, `-hold_jid`) |
+| finished jobs (`history`) | sacct | tail of the `accounting` file (`accounting_file`, `accounting_tail_mb`) |
+| cluster-wide counts (`cluster_load`) | squeue all users | `qstat -u '*' -ext`, per project |
+| QoS list & limits (`qos_info`) | sacctmgr | — (QoS panel groups by project, no limit columns) |
+| backlog estimate (`backlog`) | squeue + sinfo | — |
+| scheduler's estimated start (`est_start`) | squeue | — |
+
+Turn features off per cluster with `disable: [cluster_load, backlog]`, e.g. for a cluster
+that hides other users' jobs (this is also auto-detected: if the cluster-wide counts equal
+your own, they are shown as hidden). SGE has no "eligible" time; it is taken as the end of
+the last `-hold_jid` predecessor. Adding PBS means writing one more subclass and
+registering it in `schedulers/__init__.py`.
 
 ### Common tweaks
 
@@ -149,7 +188,8 @@ config.yaml: `sudo systemctl restart hpc-dashboard`. Stop any manually started
 - **View from phone / other machines**: set `host` in `config.yaml` to `0.0.0.0` and use
   your workstation's LAN IP. Anyone on that network can then see your job names, paths
   and output files; restrict access with your firewall.
-- **SGE**: only Slurm (squeue/sacct) is supported; SGE `qstat` is not.
+- **SGE output files**: SGE writes `jobname.o12345`; give that cluster its own
+  `inspect_files` with `"*.o{id}"`.
 
 ### Known limitations
 
@@ -166,7 +206,7 @@ config.yaml: `sudo systemctl restart hpc-dashboard`. Stop any manually started
 
 ## 中文
 
-在你自己的工作电脑上跑一个小网页，用表格看多个 Slurm 集群上你的作业状态、
+在你自己的工作电脑上跑一个小网页，用表格看多个 Slurm / SGE 集群上你的作业状态、
 跑在哪个节点、每个 QoS 上你跑了/排了多少，方便决定下一个 job 往哪交。
 
 ### 原理
@@ -218,6 +258,15 @@ python3 install.py
 Slurm 自己的预计开始时间、原因、优先级）和最终等了多久写进 `waitlog/jobs.csv`，
 另外追加 QoS / 分区的状态快照。用来以后建一个预测等待时间的模型，列的含义见
 [waitlog/README.md](waitlog/README.md)。
+
+页面最下面的"排队历史"（默认收起）读的就是这个文件：按 集群 × QoS 统计已经开始的 job
+数和等待时间（开始 − 可以排队的时间）的中位数 / P25–P75 / P90 / 最长，下面列出以前的 job
+（提交 / 开始 / 结束时间），可以搜索。
+
+- **大小上限**：`waitlog/` 文件夹超过 `waitlog_max_mb`（默认 500 MB）就不再写入，页面上会提醒。
+- **备份**：点"立即刷新"时，如果最新的备份已经超过 `waitlog_backup_days`（默认 7）天，
+  就把 `waitlog/` 打包成 `waitlog_backups/waitlog-YYYYmmdd-HHMMSS.tar.gz`，只保留最新的
+  `waitlog_backup_keep`（默认 10）份。自动刷新不会备份；上次备份之后没有变化也不会再备份。
 
 ### 装成 systemd 服务（开机自启）
 
@@ -279,7 +328,31 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
     在同一个目录里，一般是 dependency 没设对。这个只看 squeue，不用展开
   - 目录过大：读目录时 `du -sk` 的结果超过 `dir_size_warn_gb`（默认 30G）
   - 文件过多：读过的目录里文件/子目录超过 `dir_files_warn` 个（默认 50）
+  - LOOP 太慢：目录里有 `OUTCAR` 时（只 grep 最后 5 MB 里的 `LOOP`），最后一个电子步的
+    cpu / real time 显示在离子步旁边；还在跑的 job 满足 real > 1.1 × cpu **且**
+    real > cpu + 5 秒（在等通信 / IO），或者 real > 1000 秒就报警。阈值：
+    `loop_warn_ratio`、`loop_warn_extra_seconds`、`loop_warn_real_seconds`
   - 点 job id 跳过去，点路径复制
+
+### 调度系统（Slurm / SGE）
+
+`config.yaml` 里每个集群可以写 `scheduler: slurm`（默认）或 `scheduler: sge`。
+每种调度系统是 `schedulers/base.py:Scheduler` 的一个子类（`schedulers/slurm.py`、
+`schedulers/sge.py`），负责跑什么命令、怎么解析、支持哪些**功能**；页面只显示这个集群支持的：
+
+| 功能 | Slurm | SGE |
+|---|---|---|
+| 自己的 job | squeue | `qstat -u $USER -r -xml` + `qstat -j`（project、工作目录、`-hold_jid`） |
+| 已结束的 job（`history`） | sacct | tail `accounting` 文件（`accounting_file`、`accounting_tail_mb`） |
+| 全集群统计（`cluster_load`） | squeue 所有用户 | `qstat -u '*' -ext`，按 project |
+| QoS 和限额（`qos_info`） | sacctmgr | 没有（QoS 面板按 project 分组，不显示限额列） |
+| 排队积压（`backlog`） | squeue + sinfo | 没有 |
+| 调度器预计开始时间（`est_start`） | squeue | 没有 |
+
+单个集群可以用 `disable: [cluster_load, backlog]` 关掉某些功能，比如看不到别人 job 的集群
+（这个也会自动识别：全集群数字和你自己的一样时显示为"隐藏"）。SGE 没有 eligible
+（可以开始排队的）时间，用 `-hold_jid` 依赖里最后一个结束的时间来补。以后要加 PBS，
+就再写一个子类，登记到 `schedulers/__init__.py`。
 
 ### 常见调整
 
@@ -291,7 +364,8 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
 - **想在手机/同事电脑上也能看**：把 `config.yaml` 里 `host` 改成 `0.0.0.0`，
   然后用你工作电脑的局域网 IP 访问。注意这样局域网内的人都能看到你的作业名字
   等信息，公司网络环境要自己权衡安全性。
-- **SGE**：这个工具目前只写了 Slurm 的 squeue/sacct 解析，SGE 的 `qstat` 不支持。
+- **SGE 的输出文件**：SGE 写的是 `job名.o12345`，给这个集群单独写 `inspect_files`，
+  加上 `"*.o{id}"`。
 
 ### 已知限制
 

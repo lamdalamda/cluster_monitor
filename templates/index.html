@@ -140,6 +140,16 @@
   .alertbox .ai a{color:var(--text);cursor:pointer;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-decoration:underline dotted;}
   .alertbox .ai a:hover{color:var(--accent);}
   .insp .size.big{color:#ff9d9d;font-weight:600;}
+  /* 排队历史 */
+  #histH{margin-top:22px;}
+  .hist-ctl{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px;}
+  #histStats{margin-bottom:12px;}
+  .hist td{font-variant-numeric:tabular-nums;}
+  .hist.stats tbody tr{cursor:pointer;}
+  .hist.stats tbody tr:hover{background:var(--row-hover);}
+  .hist.stats tr.sel{background:#22304d;}
+  .hist td.name{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;max-width:320px;overflow:hidden;text-overflow:ellipsis;}
+  .hist .more{padding:8px 12px;color:var(--muted);font-size:12px;}
   #langBtn{font-size:12px;padding:5px 9px;}
   #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--border);padding:6px 14px;border-radius:6px;opacity:0;transition:opacity .2s;pointer-events:none;}
   #toast.show{opacity:1;}
@@ -201,6 +211,25 @@
       <tbody id="jobsBody"><tr><td colspan="11" class="empty">…</td></tr></tbody>
     </table>
   </div>
+
+  <h2 id="histH"><span data-i18n="hist_title"></span> <button id="histToggle"></button>
+    <span class="muted" data-i18n="hist_hint"></span></h2>
+  <div id="histWrap">
+    <div class="hist-ctl">
+      <select id="histDays">
+        <option value="7" data-i18n="hist_d7"></option>
+        <option value="30" data-i18n="hist_d30"></option>
+        <option value="90" data-i18n="hist_d90"></option>
+        <option value="365" data-i18n="hist_d365"></option>
+        <option value="" data-i18n="hist_dall"></option>
+      </select>
+      <select id="histCluster"></select>
+      <input type="text" id="histSearch" data-i18n-ph="hist_search_ph">
+      <span class="muted" id="histBackup"></span>
+    </div>
+    <div id="histStats" class="card"></div>
+    <div id="histJobs" class="tablewrap"></div>
+  </div>
 </main>
 <div id="toast"></div>
 
@@ -244,7 +273,7 @@ const I18N = {
     ls_more: (n, k) => `\n…（共 ${n} 个，只显示最新的 ${k} 个）`,
     need_2fa: "需要 2FA", stale_note: s => `下面是 ${s} 的旧数据`, never_fetched: `还没拉取过，点"立即刷新"`,
     load_private_tip: "这个集群的 squeue 只能看到你自己的 job（PrivateData），没法统计全集群",
-    load_tip: "所有用户在这个 QoS 上 运行 / 排队 的 job 数",
+    load_tip: "所有用户在这个 QoS 上 运行 / 排队 的 job 数", load_off_tip: "这个集群没有开全集群统计（disable: [cluster_load]）",
     sub_full: "提交已满", run_full: "运行已满", hidden: "隐藏",
     mine_summary: (r, p) => `我的：<span class="n-r">${r}</span> 运行 · <span class="n-pd">${p}</span> 排队`,
     data_at: s => `${s} 的数据`,
@@ -265,6 +294,18 @@ const I18N = {
     not_in_list: "这个 job 不在当前列表里（可能被筛选掉或超出历史窗口）",
     bg: "后台：", bg_working: "处理中", bg_steps: (d, n) => `（${d}/${n} 步）`, bg_more: n => ` · 还有 ${n} 个任务`,
     server_down: "连不上本机的 dashboard 服务",
+    al_waitlog_full: "waitlog 已满", al_slow_loop: "LOOP 太慢", loop_slow: "慢",
+    al_waitlog_full_msg: (s, l) => `${s} MB > ${l} MB，已停止写入等待时间数据。清理或归档这个文件夹，或调大 config.yaml 里的 waitlog_max_mb：`,
+    hist_title: "排队历史", hist_hint: "来自 waitlog/jobs.csv · 等待 = 开始 − 可以开始排队（依赖满足）的时间 · 点统计表一行筛选下面的 job",
+    hist_d7: "最近 7 天", hist_d30: "最近 30 天", hist_d90: "最近 90 天", hist_d365: "最近一年", hist_dall: "全部",
+    hist_search_ph: "搜索 job id / 名字 / 节点 / 分区",
+    hist_backup: (s, n, d) => s ? `最近备份 ${s}（共 ${n} 份，点"立即刷新"时超过 ${d} 天会自动再备份）` : `还没有备份（点"立即刷新"时会自动备份）`,
+    th_started: "已开始", th_median: "中位等待", th_iqr: "P25 – P75", th_p90: "P90", th_max: "最长",
+    th_still_pd: "还在排", th_no_start: "没开始就结束",
+    th_res2: "资源", th_submit: "提交", th_start: "开始", th_end: "结束", th_wait: "等待",
+    wait_tip: (e, s) => `从可以排队起：${e}\n从提交起：${s}`, wait_censored: "还没开始 / 没开始就结束，至少等了这么久",
+    hist_more: (n, k) => `共 ${n} 个 job，只显示最新的 ${k} 个，可以缩小时间范围或搜索`,
+    hist_none: "这个范围内没有记录", hist_loading: "读取中…",
   },
   en: {
     never_refreshed: "Not refreshed yet",
@@ -303,7 +344,7 @@ const I18N = {
     ls_more: (n, k) => `\n… (${n} entries, showing the newest ${k})`,
     need_2fa: "2FA needed", stale_note: s => `Showing old data from ${s}`, never_fetched: `Not fetched yet, click "Refresh"`,
     load_private_tip: "squeue on this cluster only shows your own jobs (PrivateData), so cluster-wide numbers are unavailable",
-    load_tip: "Running / pending jobs of all users in this QoS",
+    load_tip: "Running / pending jobs of all users in this QoS", load_off_tip: "Cluster-wide counts are off for this cluster (disable: [cluster_load])",
     sub_full: "submit cap", run_full: "run cap", hidden: "hidden",
     mine_summary: (r, p) => `Mine: <span class="n-r">${r}</span> running · <span class="n-pd">${p}</span> pending`,
     data_at: s => `data from ${s}`,
@@ -324,6 +365,18 @@ const I18N = {
     not_in_list: "This job isn't in the current list (filtered out or outside the history window)",
     bg: "Background: ", bg_working: "working", bg_steps: (d, n) => ` (${d}/${n} steps)`, bg_more: n => ` · ${n} more queued`,
     server_down: "Can't reach the local dashboard server",
+    al_waitlog_full: "waitlog full", al_slow_loop: "slow LOOP", loop_slow: "slow",
+    al_waitlog_full_msg: (s, l) => `${s} MB > ${l} MB, stopped writing wait-time data. Clean up or archive the folder, or raise waitlog_max_mb in config.yaml: `,
+    hist_title: "Queue history", hist_hint: "From waitlog/jobs.csv · wait = start − eligible (dependencies met) · click a summary row to filter the jobs below",
+    hist_d7: "Last 7 days", hist_d30: "Last 30 days", hist_d90: "Last 90 days", hist_d365: "Last year", hist_dall: "All",
+    hist_search_ph: "Search job id / name / node / partition",
+    hist_backup: (s, n, d) => s ? `Last backup ${s} (${n} kept; "Refresh" makes a new one when it is older than ${d} days)` : `No backup yet ("Refresh" will make one)`,
+    th_started: "Started", th_median: "Median wait", th_iqr: "P25 – P75", th_p90: "P90", th_max: "Max",
+    th_still_pd: "Pending", th_no_start: "Ended unstarted",
+    th_res2: "Resources", th_submit: "Submitted", th_start: "Started", th_end: "Ended", th_wait: "Wait",
+    wait_tip: (e, s) => `From eligible: ${e}\nFrom submit: ${s}`, wait_censored: "Not started yet / ended before starting: waited at least this long",
+    hist_more: (n, k) => `${n} jobs, showing the newest ${k}; narrow the range or search`,
+    hist_none: "No records in this range", hist_loading: "Loading…",
   },
 };
 function loadPref(k, d){ try{ const v = localStorage.getItem("hpcdash." + k); return v === null ? d : JSON.parse(v); }catch(e){ return d; } }
@@ -357,6 +410,8 @@ const BAD = new Set(["FAILED","CANCELLED","TIMEOUT","NODE_FAIL","OUT_OF_MEMORY",
 const LIGHT_TEXT = new Set(["COMPLETED","FAILED","TIMEOUT","NODE_FAIL","OUT_OF_MEMORY","PREEMPTED","BOOT_FAIL","DEADLINE","SUSPENDED"]);
 
 const colorFor = s => STATE_COLOR[s] || "#3498db";
+// 集群的调度系统支持哪些功能（后端 schedulers/ 里声明；旧缓存里没有就当全都有）
+const hasF = (c, f) => !c.features || c.features.includes(f);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const jobKey = j => j.cluster + ":" + j.id;
 const idNum = j => parseInt(j.id, 10) || 0;
@@ -367,7 +422,7 @@ const fmtRange = (a, b) => `<span class="${hCls(b)}">${Math.abs(b - a) < 0.05 ? 
 const localTime = iso => iso ? new Date(iso).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}) : "";
 
 // ---- 本地记住的界面状态（只是个人偏好，丢了也没关系）----
-let expanded = new Set(loadPref("expanded", []));
+let expanded = new Set(loadPref("expanded", []).map(k => k.replace("\u0000", "/")));
 let filters = Object.assign({cluster:"", qos:"", state:"", search:""}, loadPref("filters", {}));
 filters.search = "";
 let qosCollapsed = loadPref("qosCollapsed", false);
@@ -387,7 +442,8 @@ function stBadge(s){
 function buildGroups(jobs){
   const map = new Map();
   for (const j of jobs){
-    const k = j.cluster + "\u0000" + j.name;
+    // 分隔符不能用 \u0000：写进 data-group 属性时浏览器会把它换成 \uFFFD，点击时就对不上了
+    const k = j.cluster + "/" + j.name;
     if (!map.has(k)) map.set(k, {key:k, cluster:j.cluster, name:j.name, jobs:[]});
     map.get(k).jobs.push(j);
   }
@@ -531,6 +587,15 @@ function fileSummary(f){
   return `<span class="ff"><b>${esc(f.name)}</b> <span class="muted">${esc(f.mtime || "")}</span> ${bits.join(" · ")}</span>`;
 }
 
+// OUTCAR 里最后一个电子步（LOOP:）/ 离子步（LOOP+:）的 cpu time 和 real time
+function loopSummary(lp){
+  if (!lp || !lp.elec) return "";
+  const e = lp.elec, i = lp.ionic;
+  const tip = [`LOOP:  cpu ${e.cpu}s · real ${e.real}s`, i ? `LOOP+: cpu ${i.cpu}s · real ${i.real}s` : "", lp.warn ? tr(lp.warn) : ""].filter(Boolean).join("\n");
+  return `<span class="ff" title="${esc(tip)}"><b>LOOP</b> cpu <span class="v">${e.cpu.toFixed(0)}s</span> · real <span class="v${lp.warn ? " size big" : ""}">${e.real.toFixed(0)}s</span>`
+    + (lp.warn ? ` <span class="bad-tag">${t("loop_slow")}</span>` : "") + `</span>`;
+}
+
 function detailRow(j){
   const k = jobKey(j), ins = (lastData.inspect || {})[k], pending = pendingInspect.has(k);
   const reload = `<button data-insp-reload="${esc(k)}"${pending ? " disabled" : ""}>${pending ? t("reading") : ins ? t("reread") : t("read")}</button>`;
@@ -550,7 +615,7 @@ function detailRow(j){
     if (!ins.exists){
       body = `${path} <span class="bad-tag">${t("no_dir")}</span> ${reload}`;
     } else {
-      const files = ins.files.length ? ins.files.map(fileSummary).join("") : `<span class="muted">${t("no_files")}</span>`;
+      const files = (ins.files.length ? ins.files.map(fileSummary).join("") : `<span class="muted">${t("no_files")}</span>`) + loopSummary(ins.loop);
       const open = detailOpen.has(k);
       const manyFiles = ins.count > ((lastData.settings || {}).dir_files_warn || Infinity);
       body = `${path}${sizeHtml}<span class="${manyFiles ? "size big" : "muted"}">${t("n_files", ins.count ?? "?")}</span>${shared}${files}
@@ -624,7 +689,8 @@ function renderQos(){
     if (c.never) return `<div class="card"><div class="card-h"><span class="dot" style="--c:#4a5063"></span>${esc(c.name)}</div><div class="card-err" style="color:var(--muted)">${t("never_fetched")}</div></div>`;
     if (!c.ok && !c.stale_since) return `<div class="card"><div class="card-h">${dot}${esc(c.name)}${authTag}</div>${errHtml}</div>`;
     const mr = c.qos.reduce((a, q) => a + q.mine_running, 0), mp = c.qos.reduce((a, q) => a + q.mine_pending, 0);
-    const loadTip = c.load_private ? t("load_private_tip") : t("load_tip");
+    const loadTip = c.load_private ? t("load_private_tip") : !hasF(c, "cluster_load") ? t("load_off_tip") : t("load_tip");
+    const lim = hasF(c, "qos_info");  // 没有限额信息（比如 SGE）就不显示那几列
     const rows = c.qos.map(q => {
       const sel = filters.qos === c.name + "|" + q.name;
       const maxJ = parseInt(q.max_jobs_pu, 10), maxS = parseInt(q.max_submit_pu, 10);
@@ -637,23 +703,23 @@ function renderQos(){
       return `<tr class="${sel ? "sel" : ""} ${subfull ? "subfull" : full ? "full" : ""} ${idle ? "idle" : ""}" data-qos="${esc(c.name + "|" + q.name)}">
         <td class="qname">${esc(q.name)}${tags}${q.note ? `<span class="note">${esc(q.note)}</span>` : ""}</td>
         <td class="mine">${n(q.mine_running, "n-r")} / ${n(q.mine_pending, "n-pd")}</td>
-        <td title="${esc(loadTip)}">${c.load_private ? `<span class="n-0">${t("hidden")}</span>` : `${n(q.all_running, "n-r")} / ${n(q.all_pending, "n-pd")}`}</td>
-        <td class="lim">${esc(q.max_jobs_pu || "-")}</td>
+        <td title="${esc(loadTip)}">${c.load_private || !hasF(c, "cluster_load") ? `<span class="n-0">${t("hidden")}</span>` : `${n(q.all_running, "n-r")} / ${n(q.all_pending, "n-pd")}`}</td>
+        ${lim ? `<td class="lim">${esc(q.max_jobs_pu || "-")}</td>
         <td class="lim">${esc(q.max_submit_pu || "-")}</td>
         <td class="lim">${esc(q.max_wall || "-")}</td>
-        <td class="lim tres">${esc((q.max_tres_pu || "-").replace(/,/g, ", "))}</td>
+        <td class="lim tres">${esc((q.max_tres_pu || "-").replace(/,/g, ", "))}</td>` : ""}
       </tr>`;
     }).join("");
     return `<div class="card">
       <div class="card-h">${dot}${esc(c.name)}${authTag}<span class="muted">${t("mine_summary", mr, mp)}</span><span class="muted at">${c.ok ? t("data_at", localTime(c.at)) : ""}</span></div>
       ${errHtml}
       <table class="qos">
-        <thead><tr><th>QoS</th><th>${t("th_mine")}</th><th title="${esc(loadTip)}">${t("th_all")}</th>
-          <th title="${t("th_maxjobs_tip")}">MaxJobs</th>
+        <thead><tr><th>${esc(c.qos_label || "QoS")}</th><th>${t("th_mine")}</th><th title="${esc(loadTip)}">${t("th_all")}</th>
+          ${lim ? `<th title="${t("th_maxjobs_tip")}">MaxJobs</th>
           <th title="${t("th_maxsubmit_tip")}">MaxSubmit</th>
           <th title="${t("th_maxwall_tip")}">MaxWall</th>
-          <th title="${t("th_maxtres_tip")}">${t("th_maxtres")}</th></tr></thead>
-        <tbody>${rows || `<tr><td colspan="7" class="empty">${t("no_qos")}</td></tr>`}</tbody>
+          <th title="${t("th_maxtres_tip")}">${t("th_maxtres")}</th>` : ""}</tr></thead>
+        <tbody>${rows || `<tr><td colspan="${lim ? 7 : 3}" class="empty">${t("no_qos")}</td></tr>`}</tbody>
       </table></div>`;
   }).join("");
 }
@@ -718,7 +784,11 @@ function renderAlerts(){
   const jobLinks = a => a.jobs.slice(0, 8).map(id => `<a data-jump="${esc(a.cluster + ":" + id)}">#${esc(id)}</a>`).join(" ") + (a.jobs.length > 8 ? t("and_n", a.jobs.length) : "");
   const path = a => `<span class="p" data-copy="${esc(a.dir)}" title="${t("click_copy_path")}">${esc(a.dir)}</span>`;
   const limitFiles = (lastData.settings || {}).dir_files_warn || 50;
-  const item = a => a.type === "same_dir"
+  const item = a => a.type === "slow_loop"
+    ? `<div class="ai"><span class="k big">${t("al_slow_loop")}</span><b>${esc(a.cluster)}</b> ${esc(tr(a.reason))}: ${jobLinks(a)} ${path(a)}</div>`
+    : a.type === "waitlog_full"
+    ? `<div class="ai"><span class="k big">${t("al_waitlog_full")}</span>${t("al_waitlog_full_msg", a.size_mb, a.limit_mb)} ${path(a)}</div>`
+    : a.type === "same_dir"
     ? `<div class="ai"><span class="k">${t("al_same_dir")}</span><b>${esc(a.cluster)}</b> ${t("al_same_dir_msg", a.jobs.length)}${jobLinks(a)}${a.stale ? ` <span class="muted">${t("al_stale")}</span>` : ""} ${path(a)}</div>`
     : a.type === "many_files"
     ? `<div class="ai"><span class="k">${t("al_many_files")}</span><b>${esc(a.cluster)}</b> ${t("n_entries", a.count)} &gt; ${limitFiles}: ${jobLinks(a)} ${path(a)}</div>`
@@ -757,6 +827,100 @@ function render(){
 }
 
 function setFilter(k, v){ filters[k] = v; savePref("filters", {...filters, search: ""}); render(); }
+
+// ---------------- 排队历史 ----------------
+let histCollapsed = loadPref("histCollapsed", true);
+let hist = Object.assign({days: "30", cluster: "", qos: ""}, loadPref("hist", {}), {search: ""});
+let histData = null, histSeq = 0, histFor = null;
+const fmtWait = h => h === null || h === undefined ? `<span class="n-0">—</span>` : `<span class="${hCls(h)}">${fmtH(h)}</span>`;
+
+async function loadHistory(){
+  if (histCollapsed) return;
+  const seq = ++histSeq;
+  const qs = new URLSearchParams({days: hist.days, cluster: hist.cluster, qos: hist.qos, q: hist.search});
+  try{
+    const data = await (await fetch("api/history?" + qs)).json();
+    if (seq !== histSeq) return;  // 已经有更新的请求了
+    histData = data; histFor = lastData && lastData.updated_at;
+  }catch(e){ return; }
+  renderHistory();
+}
+
+function renderHistory(){
+  document.getElementById("histWrap").style.display = histCollapsed ? "none" : "";
+  document.getElementById("histToggle").textContent = histCollapsed ? t("expand") : t("collapse");
+  if (histCollapsed) return;
+  const csel = document.getElementById("histCluster");
+  const clusters = ((lastData && lastData.clusters) || []).map(c => c.name);
+  if (hist.cluster && !clusters.includes(hist.cluster)) clusters.push(hist.cluster);
+  csel.innerHTML = `<option value="">${t("all_clusters")}</option>` + clusters.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+  csel.value = hist.cluster;
+  document.getElementById("histDays").value = hist.days;
+  const statsEl = document.getElementById("histStats"), jobsEl = document.getElementById("histJobs");
+  const d = histData;
+  if (!d){ statsEl.innerHTML = `<div class="empty">${t("hist_loading")}</div>`; jobsEl.innerHTML = ""; return; }
+  if (!d.ok){ statsEl.innerHTML = `<div class="card-err">${esc(tr(d.error))}</div>`; jobsEl.innerHTML = ""; return; }
+  document.getElementById("histBackup").textContent = t("hist_backup",
+    d.last_backup ? new Date(d.last_backup).toLocaleString([], {year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"}) : "",
+    d.n_backups, d.backup_days);
+  const n = v => v ? v : `<span class="n-0">0</span>`;
+  const srows = d.stats.map(s => {
+    const key = s.cluster + "|" + s.qos;
+    return `<tr class="${hist.qos && hist.qos === key ? "sel" : ""}" data-hq="${esc(key)}">
+      <td>${esc(s.cluster)}</td><td>${esc(s.qos || "-")}</td><td>${n(s.started)}</td>
+      <td>${fmtWait(s.median)}</td>
+      <td>${s.p25 === null ? fmtWait(null) : `${fmtWait(s.p25)} – ${fmtWait(s.p75)}`}</td>
+      <td>${fmtWait(s.p90)}</td><td>${fmtWait(s.max)}</td>
+      <td>${s.pending ? `<span class="n-pd">${s.pending}</span>` : n(0)}</td><td>${n(s.no_start)}</td></tr>`;
+  }).join("");
+  statsEl.innerHTML = `<table class="hist stats"><thead><tr><th>${t("col_cluster")}</th><th>QoS</th><th>${t("th_started")}</th>
+    <th>${t("th_median")}</th><th>${t("th_iqr")}</th><th>${t("th_p90")}</th><th>${t("th_max")}</th>
+    <th>${t("th_still_pd")}</th><th>${t("th_no_start")}</th></tr></thead>
+    <tbody>${srows || `<tr><td colspan="9" class="empty">${t("hist_none")}</td></tr>`}</tbody></table>`;
+  const res = j => `${esc(j.cpus || "?")}C${j.gpus && j.gpus !== "0" ? ` / ${esc(j.gpus)}G${j.gpu_type ? " " + esc(j.gpu_type) : ""}` : ""}`;
+  const wait = j => {
+    const tip = t("wait_tip", j.wait_h === null ? "-" : fmtH(j.wait_h), j.wait_submit_h === null ? "-" : fmtH(j.wait_submit_h));
+    if (j.wait_h === null) return `<span class="n-0">—</span>`;
+    return j.censored ? `<span class="muted" title="${esc(t("wait_censored") + "\n" + tip)}">≥ ${fmtH(j.wait_h)}</span>`
+                      : `<span title="${esc(tip)}">${fmtWait(j.wait_h)}</span>`;
+  };
+  const jrows = d.jobs.map(j => `<tr>
+      <td>${esc(j.cluster)}</td><td class="jid" data-copy="${esc(j.jobid)}" title="${t("click_copy")}">${esc(j.jobid)}</td>
+      <td class="name" title="${esc(j.name)}">${esc(j.name)}</td><td>${j.state ? stBadge(j.state) : ""}</td>
+      <td>${esc(j.qos || "-")}</td><td class="part" title="${esc(j.partition)}">${esc(j.partition || "-")}</td>
+      <td>${res(j)}</td><td>${fmtTime(j.submit)}</td><td>${fmtTime(j.start)}</td><td>${fmtTime(j.end)}</td>
+      <td>${wait(j)}</td></tr>`).join("");
+  jobsEl.innerHTML = `<table class="hist"><thead><tr><th>${t("col_cluster")}</th><th>Job ID</th><th>${t("col_name")}</th>
+    <th>${t("col_state")}</th><th>QoS</th><th>${t("col_partition")}</th><th>${t("th_res2")}</th>
+    <th>${t("th_submit")}</th><th>${t("th_start")}</th><th>${t("th_end")}</th><th>${t("th_wait")}</th></tr></thead>
+    <tbody>${jrows || `<tr><td colspan="11" class="empty">${t("hist_none")}</td></tr>`}</tbody></table>`
+    + (d.total > d.jobs.length ? `<div class="more">${t("hist_more", d.total, d.jobs.length)}</div>` : "");
+}
+
+function setHist(k, v){
+  hist[k] = v;
+  savePref("hist", {days: hist.days, cluster: hist.cluster, qos: hist.qos});
+  loadHistory();
+}
+document.getElementById("histToggle").addEventListener("click", () => {
+  histCollapsed = !histCollapsed; savePref("histCollapsed", histCollapsed);
+  renderHistory(); loadHistory();
+});
+document.getElementById("histDays").addEventListener("change", e => setHist("days", e.target.value));
+document.getElementById("histCluster").addEventListener("change", e => setHist("cluster", e.target.value));
+let histSearchTimer = null;
+document.getElementById("histSearch").addEventListener("input", e => {
+  clearTimeout(histSearchTimer);
+  histSearchTimer = setTimeout(() => setHist("search", e.target.value.trim()), 300);
+});
+document.getElementById("histStats").addEventListener("click", e => {
+  const row = e.target.closest("tr[data-hq]");
+  if (row) setHist("qos", hist.qos === row.dataset.hq ? "" : row.dataset.hq);
+});
+document.getElementById("histJobs").addEventListener("click", e => {
+  const copy = e.target.closest("[data-copy]");
+  if (copy) copyText(copy.dataset.copy).then(() => toast(t("copied", copy.dataset.copy)));
+});
 
 // ---------------- 交互 ----------------
 function toast(msg){
@@ -824,6 +988,7 @@ document.getElementById("langBtn").addEventListener("click", () => {
   savePref("lang", lang);
   applyStatic();
   render();
+  renderHistory();
   if (lastProgress) renderProgress(lastProgress);
 });
 
@@ -853,6 +1018,8 @@ async function loadJobs(){
   lastData = await res.json();
   version = lastData.version;
   render();
+  // 刷新之后 jobs.csv 变了，重新拉一次历史
+  if (!histCollapsed && lastData.updated_at !== histFor) loadHistory();
   renderProgress(lastData.progress);
 }
 
@@ -872,6 +1039,7 @@ function kick(){ clearTimeout(tickTimer); tickTimer = setTimeout(tick, 150); }
 applyStatic();
 renderFilters();
 renderUpdated();
+renderHistory();
 tick();
 </script>
 </body>

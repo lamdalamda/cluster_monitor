@@ -35,10 +35,11 @@ from datetime import datetime, timezone
 import yaml
 from flask import Flask, jsonify, render_template, request
 
-import backlog
 import jobfiles
+import schedulers
 import waitlog
 from i18n import L, as_l, prefixed, suffixed
+from schedulers.base import ACTIVE, PENDING
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.yaml")
@@ -47,66 +48,6 @@ ASKPASS = os.path.join(APP_DIR, "ssh_askpass_abort.sh")
 CACHE_PATH = os.path.join(APP_DIR, ".dashboard_cache.json")
 INSPECT_CHUNK = 8  # 每次 SSH 看几个目录
 MAX_IDS_PER_DIR = 10  # 同一个目录里最多给几个 job 找各自的 slurm 输出文件
-
-SQUEUE_FIELDS = [
-    "jobid",
-    "partition",
-    "name",
-    "user",
-    "state",
-    "time",
-    "timelimit",
-    "nnodes",
-    "nodelist_reason",
-    "qos",
-    "submit",
-    "start",
-    "cpus",
-    "tres",
-    "workdir",
-    "priority",
-    "dependency",
-]
-SQUEUE_FORMAT = "%i|%P|%j|%u|%T|%M|%l|%D|%R|%q|%V|%S|%C|%b|%Z|%Q|%E"
-
-SACCT_FIELDS = [
-    "jobid",
-    "name",
-    "state",
-    "partition",
-    "qos",
-    "nodelist",
-    "elapsed",
-    "timelimit",
-    "submit",
-    "start",
-    "end",
-    "req_tres",
-    "eligible",
-    "workdir",
-]
-SACCT_FORMAT = (
-    "JobID,JobName,State,Partition,QOS,NodeList,Elapsed,Timelimit,Submit,Start,End,"
-    "ReqTRES,Eligible,WorkDir"
-)
-
-QOS_LIMIT_FIELDS = ["name", "max_jobs_pu", "max_submit_pu", "max_wall", "max_tres_pu"]
-QOS_LIMIT_FORMAT = "Name,MaxJobsPU,MaxSubmitPU,MaxWall,MaxTRESPU"
-
-# 结束态判定（用于着色 & 判断依赖是否已经满足）
-TERMINAL_OK = {"COMPLETED"}
-TERMINAL_BAD = {
-    "FAILED",
-    "CANCELLED",
-    "TIMEOUT",
-    "NODE_FAIL",
-    "OUT_OF_MEMORY",
-    "PREEMPTED",
-    "BOOT_FAIL",
-    "DEADLINE",
-}
-ACTIVE = {"RUNNING", "COMPLETING", "CONFIGURING"}
-PENDING = {"PENDING", "SUSPENDED", "REQUEUED", "REQUEUE_HOLD", "RESV_DEL_HOLD"}
 
 
 def load_config():
@@ -186,136 +127,6 @@ def split_sections(output):
     return sections, failed
 
 
-def parse_dependency(dep_raw):
-    """squeue 的 %E 字段形如 'afterok:12345(unfulfilled),afterany:12346_*' 或 '(null)'。
-    返回 [{"type": "afterok", "id": "12345", "status": "unfulfilled"}, ...]"""
-    if not dep_raw or dep_raw.strip() in ("(null)", "", "N/A"):
-        return []
-    deps = []
-    for item in re.split(r"[,?]", dep_raw):
-        m = re.match(r"(\w+)(?::(.+?))?(?:\((\w+)\))?$", item.strip())
-        if not m:
-            continue
-        dep_type, ids_str, status = m.group(1), m.group(2) or "", m.group(3) or ""
-        ids_str = re.sub(r"\+\d+", "", ids_str)  # after:123+60 里的 +60 是分钟数
-        for dep_id in dict.fromkeys(re.findall(r"(\d+)(?:_[\d*]+)?", ids_str)):
-            deps.append({"type": dep_type, "id": dep_id, "status": status})
-        if not ids_str:  # singleton 之类不带 id 的
-            deps.append({"type": dep_type, "id": "", "status": status})
-    return deps
-
-
-def clean_time(v):
-    return "" if v in ("N/A", "Unknown", "None", "NONE", "") else v
-
-
-def parse_squeue(lines, cluster_name):
-    jobs = {}
-    for line in lines:
-        parts = line.split("|")
-        if len(parts) != len(SQUEUE_FIELDS):
-            continue
-        rec = dict(zip(SQUEUE_FIELDS, parts))
-        state = rec["state"]
-        jobs[rec["jobid"]] = {
-            "id": rec["jobid"],
-            "cluster": cluster_name,
-            "name": rec["name"],
-            "partition": rec["partition"],
-            "qos": rec["qos"],
-            "state": state,
-            "time_used": rec["time"],
-            "time_limit": rec["timelimit"],
-            "nnodes": rec["nnodes"],
-            "nodelist": rec["nodelist_reason"] if state in ACTIVE else "",
-            "reason": rec["nodelist_reason"].strip("()") if state not in ACTIVE else "",
-            "submit": clean_time(rec["submit"]),
-            "start": clean_time(rec["start"]),  # PENDING 时是 Slurm 预计的开始时间
-            "end": "",
-            "cpus": rec["cpus"],
-            "tres": rec["tres"] if rec["tres"] not in ("N/A", "(null)") else "",
-            "workdir": rec["workdir"],
-            "priority": rec["priority"],
-            "dependency_raw": rec["dependency"] if rec["dependency"] != "(null)" else "",
-            "deps": parse_dependency(rec["dependency"]),
-            "source": "squeue",
-        }
-    return jobs
-
-
-def parse_sacct(lines, cluster_name):
-    jobs = {}
-    for line in lines:
-        parts = line.split("|")
-        if len(parts) != len(SACCT_FIELDS):
-            continue
-        rec = dict(zip(SACCT_FIELDS, parts))
-        jobid = rec["jobid"]
-        if "." in jobid:  # 保险起见再过滤一次 step（正常 -X 已经排除）
-            continue
-        state = rec["state"].split(" ")[0]  # "CANCELLED by 12345" -> "CANCELLED"
-        jobs[jobid] = {
-            "id": jobid,
-            "cluster": cluster_name,
-            "name": rec["name"],
-            "partition": rec["partition"],
-            "qos": rec["qos"],
-            "state": state,
-            "time_used": rec["elapsed"],
-            "time_limit": rec["timelimit"],
-            "nnodes": "",
-            "nodelist": rec["nodelist"] if rec["nodelist"] != "None assigned" else "",
-            "reason": "",
-            "submit": clean_time(rec["submit"]),
-            "start": clean_time(rec["start"]),
-            "end": clean_time(rec["end"]),
-            "workdir": rec["workdir"],
-            "req_tres": rec["req_tres"],
-            "eligible": clean_time(rec["eligible"]),
-            "dependency_raw": "",
-            "deps": [],
-            "source": "sacct",
-        }
-    return jobs
-
-
-def parse_load(lines):
-    """'  3506 freecpu|PENDING' -> {"freecpu": {"running": 0, "pending": 3506}}"""
-    load = {}
-    for line in lines:
-        m = re.match(r"(\d+)\s+(.*)\|(\w+)$", line)
-        if not m:
-            continue
-        count, qos, state = int(m.group(1)), m.group(2), m.group(3)
-        entry = load.setdefault(qos, {"running": 0, "pending": 0})
-        if state == "RUNNING":
-            entry["running"] += count
-        elif state == "PENDING":
-            entry["pending"] += count
-    return load
-
-
-def parse_assoc(lines):
-    names = []
-    for line in lines:
-        for q in line.split(","):
-            q = q.strip()
-            if q and q not in names:
-                names.append(q)
-    return names
-
-
-def parse_qos_limits(lines):
-    limits = {}
-    for line in lines:
-        parts = line.split("|")
-        if len(parts) != len(QOS_LIMIT_FIELDS):
-            continue
-        rec = dict(zip(QOS_LIMIT_FIELDS, parts))
-        limits[rec.pop("name")] = rec
-    return limits
-
-
 def normalize_qos_config(raw):
     """config.yaml 里 qos 可以写成字符串，也可以写成 {name, note}"""
     out = []
@@ -369,9 +180,12 @@ class Backend:
         self.auth_blocked = {}  # cluster name -> {"until": t, "error": str}
         # 每次刷新把请求资源 / 当时的集群状态 / 等待时间记到 waitlog/*.csv（以后建模用）
         self.waitlog = None
+        self.waitlog_dir = os.path.join(APP_DIR, config.get("waitlog_dir", "waitlog"))
+        self.backup_dir = os.path.join(APP_DIR, config.get("waitlog_backup_dir", "waitlog_backups"))
+        self.waitlog_full = None  # 超过 waitlog_max_mb 时：{"size_mb", "limit_mb"}，不再写入
         if config.get("waitlog", True):
-            self.waitlog = waitlog.WaitLog(
-                os.path.join(APP_DIR, config.get("waitlog_dir", "waitlog")))
+            self.waitlog = waitlog.WaitLog(self.waitlog_dir)
+            self.check_waitlog_size()
         self.load_cache()
 
     def clusters(self):
@@ -419,12 +233,17 @@ class Backend:
         self.version += 1
         self.cv.notify()
 
-    def enqueue_refresh(self, force=True):
+    def enqueue_refresh(self, force=True, manual=False):
+        """manual: 用户点了"立即刷新"（只有这时才检查要不要备份 waitlog）"""
         with self.lock:
-            if any(t["kind"] == "refresh" for t in self.queue):
-                return False  # 已经排着一个刷新了
+            queued = next((t for t in self.queue if t["kind"] == "refresh"), None)
+            if queued:  # 已经排着一个刷新了
+                queued["manual"] = queued.get("manual") or manual
+                queued["force"] = queued.get("force") or force
+                return False
             n = len(self.clusters())
-            self._enqueue({"kind": "refresh", "label": L("刷新作业状态", "Refreshing job status"), "steps": n, "force": force})
+            self._enqueue({"kind": "refresh", "label": L("刷新作业状态", "Refreshing job status"),
+                           "steps": n, "force": force, "manual": manual})
             return True
 
     def _jobs_of(self, cluster):
@@ -502,15 +321,50 @@ class Backend:
             self.batch_done += 1
             self.version += 1
 
+    def check_waitlog_size(self):
+        """waitlog 文件夹超过上限就停止写入（页面上会提醒）。返回 True = 还能写"""
+        limit_mb = self.config.get("waitlog_max_mb", 500) or 0
+        if limit_mb <= 0:
+            self.waitlog_full = None
+            return True
+        size_mb = waitlog.dir_size(self.waitlog_dir) / 1048576
+        full = {"size_mb": round(size_mb, 1), "limit_mb": limit_mb} if size_mb > limit_mb else None
+        with self.lock:
+            if full != self.waitlog_full:
+                self.version += 1
+            self.waitlog_full = full
+        return full is None
+
+    def maybe_backup_waitlog(self):
+        """点"立即刷新"时调用：最新的备份超过 waitlog_backup_days 天就打一个新的 tar.gz"""
+        days = self.config.get("waitlog_backup_days", 7)
+        if not self.waitlog or not waitlog.backup_due(self.waitlog_dir, self.backup_dir, days):
+            return
+        with self.lock:
+            self.batch_total += 1
+        self._step(L("备份 waitlog", "Backing up waitlog"))
+        try:
+            waitlog.make_backup(self.waitlog_dir, self.backup_dir,
+                                self.config.get("waitlog_backup_keep", 10))
+            with self.lock:
+                self.results.get("_errors", {}).pop("waitlog_backup", None)
+        except Exception as e:  # noqa: BLE001  备份失败不影响刷新
+            with self.lock:
+                self.results.setdefault("_errors", {})["waitlog_backup"] = L(
+                    f"备份 waitlog 出错: {e}", f"Failed to back up waitlog: {e}")
+        self._step_done()
+
     def run_refresh(self, task):
         clusters = self.clusters()
+        if task.get("manual"):
+            self.maybe_backup_waitlog()
         for i, c in enumerate(clusters, 1):
             self._step(L(f"刷新 {c['name']}（{i}/{len(clusters)}）",
                          f"Refreshing {c['name']} ({i}/{len(clusters)})"))
             r = self.poll_cluster(c, task.get("force", True))
             with self.lock:
                 self.store_result(r)
-            if r["ok"] and self.waitlog:
+            if r["ok"] and self.waitlog and self.check_waitlog_size():
                 try:
                     self.waitlog.update(r)
                     with self.lock:
@@ -565,9 +419,11 @@ class Backend:
                         "Cluster needs 2FA: log in once in a terminal, then retry")
             else:
                 du_timeout = cfg.get("dir_size_timeout_seconds", 20)
+                # 单个集群可以有自己的 inspect_files（比如 SGE 的输出文件叫 name.o12345）
                 cmd = jobfiles.build_cmd(
-                    plan, cfg.get("inspect_files", jobfiles.DEFAULT_PATTERNS),
-                    cfg.get("inspect_tail_lines", 30), du_timeout=du_timeout)
+                    plan, c.get("inspect_files") or cfg.get("inspect_files", jobfiles.DEFAULT_PATTERNS),
+                    cfg.get("inspect_tail_lines", 30), du_timeout=du_timeout,
+                    loop_file=cfg.get("loop_file", "OUTCAR"))
                 timeout = cfg.get("ssh_timeout_seconds", 15) * 2 + du_timeout * len(dirs)
                 try:
                     ok, out, err = run_ssh(c["ssh_host"], cmd, timeout)
@@ -578,6 +434,8 @@ class Backend:
                     parsed = jobfiles.parse_output(out)
                     for n, (d, _) in enumerate(plan):
                         results[d] = parsed.get(n) or {"error": L("没拿到输出", "No output")}
+                        if results[d].get("loop"):
+                            results[d]["loop"]["warn"] = jobfiles.loop_warning(results[d]["loop"], cfg)
                     err = None
                 else:
                     err = err or L("ssh 失败", "ssh failed")
@@ -644,6 +502,8 @@ class Backend:
                     "need_input": r.get("need_input", False),
                     "stale_since": r.get("stale_since"), "at": r.get("at"),
                     "load_private": r.get("load_private", False), "qos": r.get("qos", []),
+                    "scheduler": r.get("scheduler", "slurm"), "qos_label": r.get("qos_label", "QoS"),
+                    "features": r.get("features", sorted(schedulers.ALL_FEATURES)),
                     "backlog": r.get("backlog"),
                 })
             errors.extend(as_l(e) for e in self.results.get("_errors", {}).values())
@@ -692,6 +552,8 @@ class Backend:
     def alerts(self, jobs):
         """界面上的小提醒。调用方已持有 self.lock。"""
         out = []
+        if self.waitlog_full:
+            out.append({"type": "waitlog_full", "dir": self.waitlog_dir, **self.waitlog_full})
         # 1) 好几个 job 同时在同一个目录里跑（一般是 dependency 没设对）
         #    同一个 array job 的不同 task 共用目录是正常的，不算
         running = {}
@@ -718,6 +580,13 @@ class Backend:
             if size and size > limit_kb:
                 out.append({"type": "big_dir", "cluster": cluster, "dir": d, "size_kb": size,
                             "jobs": sorted(by_dir[dk])})
+            # 3) OUTCAR 的 LOOP 时间不对劲（只报还在跑的 job，跑完的在展开后能看到）
+            warn = (ins.get("loop") or {}).get("warn")
+            running_here = sorted(j["id"] for j in jobs if j["state"] in ACTIVE
+                                  and j.get("workdir") and dir_key(j["cluster"], j["workdir"]) == dk)
+            if warn and running_here:
+                out.append({"type": "slow_loop", "cluster": cluster, "dir": d, "jobs": running_here,
+                            "loop": ins["loop"], "reason": warn})
             count = ins.get("count")
             if limit_files and count and count > limit_files:
                 out.append({"type": "many_files", "cluster": cluster, "dir": d, "count": count,
@@ -736,32 +605,22 @@ class Backend:
                                       f" (auto retry at {retry}, or log in and click Refresh)"),
                     "warnings": [], "jobs": {}, "qos": []}
 
+        try:
+            sched = schedulers.make(c, cfg)
+        except ValueError as e:
+            return {"name": name, "ok": False, "error": str(e), "warnings": [], "jobs": {}, "qos": []}
         timeout = cfg.get("ssh_timeout_seconds", 15)
-        hours = cfg.get("history_hours", 48)
-        with_load = cfg.get("show_cluster_load", True)
+        with_load = sched.has("cluster_load")
         refresh_s = cfg.get("qos_info_refresh_minutes", 30) * 60
         cached = self.qos_info.get(name)
-        with_qos_info = cached is None or now - cached["fetched_at"] > refresh_s
-        bl_cached = self.backlog.get(name)
-        with_backlog = c.get("backlog", cfg.get("backlog", True)) and (
+        with_qos_info = sched.has("qos_info") and (cached is None or now - cached["fetched_at"] > refresh_s)
+        bl_cached = self.backlog.get(name) if sched.has("backlog") else None
+        with_backlog = sched.has("backlog") and (
             bl_cached is None
             or now - bl_cached["fetched_at"] > cfg.get("backlog_refresh_minutes", 5) * 60
         )
-
-        steps = [
-            ("SQUEUE", f"squeue --me -h -o '{SQUEUE_FORMAT}'"),
-            ("SACCT", f"sacct -X --starttime=now-{hours}hours -o {SACCT_FORMAT} "
-                      f"--parsable2 --noheader"),
-        ]
-        if with_load:
-            # 全集群（所有用户）每个 QoS 的 running/pending 数，用来判断哪里比较空
-            steps.append(("LOAD", "squeue -h -t RUNNING,PENDING -o '%q|%T' | sort | uniq -c"))
-        if with_qos_info:
-            steps.append(("ASSOC", "sacctmgr -nP show assoc user=$USER format=qos"))
-            steps.append(("QOS", f"sacctmgr -nP show qos format={QOS_LIMIT_FORMAT}"))
-        if with_backlog:
-            steps.append(("ME", "id -un"))
-            steps.extend(backlog.COMMANDS)
+        steps = sched.steps({"history_hours": cfg.get("history_hours", 48), "load": with_load,
+                             "qos_info": with_qos_info, "backlog": with_backlog})
 
         timeout_total = timeout * (2 if with_backlog else 1)
         try:
@@ -781,32 +640,26 @@ class Backend:
 
         sections, failed = split_sections(out)
         warnings = []
-        if "END" not in sections or {"SQUEUE", "SACCT"} <= failed:
-            return {"name": name, "ok": False, "error": err[-300:] or L("squeue/sacct 都失败了", "Both squeue and sacct failed"),
+        required = sched.required_sections()
+        if "END" not in sections or required <= failed:
+            names = "/".join(sorted(x.lower() for x in required))
+            return {"name": name, "ok": False, "error": err[-300:] or L(f"{names} 都失败了", f"{names} all failed"),
                     "warnings": [], "jobs": {}, "qos": []}
         for sec in sorted(failed):
             if not sec.startswith("BL_"):  # 积压分析失败会在积压面板里说明，这里不重复报
                 warnings.append(L(f"{sec.lower()} 命令失败", f"{sec.lower()} command failed"))
 
-        hist = parse_sacct(sections.get("SACCT", []), name)
-        active = parse_squeue(sections.get("SQUEUE", []), name)
-        jobs = {}
-        for jid in list(hist) + [j for j in active if j not in hist]:
-            rec = dict(hist.get(jid, {}))
-            # squeue(活跃)覆盖 sacct(历史)，但不拿空值覆盖（比如 sacct 才有的 end）
-            rec.update({k: v for k, v in active.get(jid, {}).items() if v not in ("", [])})
-            rec.setdefault("deps", [])
-            jobs[jid] = rec
+        with self.lock:
+            prev_jobs = dict((self.last_good.get(name) or {}).get("jobs", {}))
+        jobs = sched.parse_jobs(sections, prev_jobs)
 
         if with_qos_info:
-            cached = {
-                "assoc": parse_assoc(sections.get("ASSOC", [])),
-                "limits": parse_qos_limits(sections.get("QOS", [])),
-                "fetched_at": time.time(),
-            }
+            cached = {**sched.parse_qos_info(sections), "fetched_at": time.time()}
             self.qos_info[name] = cached
-        load = parse_load(sections.get("LOAD", [])) if with_load else {}
-        # 有的集群（比如 PrivateData=jobs）squeue 只能看到自己的 job，
+        if not sched.has("qos_info"):
+            cached = {"assoc": [], "limits": {}}
+        load = sched.parse_load(sections) if with_load else {}
+        # 有的集群（比如 PrivateData=jobs）只能看到自己的 job，
         # 这时"全集群"数字其实就是你自己的，没有参考价值，标记一下前端显示为隐藏
         mine_active = sum(1 for j in jobs.values() if j["state"] in ACTIVE | PENDING)
         load_total = sum(v["running"] + v["pending"] for v in load.values())
@@ -815,9 +668,8 @@ class Backend:
             load, with_load = {}, False
 
         if with_backlog:
-            me = (sections.get("ME") or [""])[0]
             try:
-                result, model = backlog.analyze(sections, me)
+                result, model = sched.analyze_backlog(sections)
             except Exception as e:  # noqa: BLE001
                 result, model = {"ok": False, "error": L(f"积压分析出错: {e}",
                                                        f"Backlog analysis failed: {e}")}, None
@@ -826,11 +678,12 @@ class Backend:
             self.backlog[name] = bl_cached
         if bl_cached:
             for j in jobs.values():
-                if j["state"] in PENDING and j["source"] == "squeue":
-                    j["wait_est"] = backlog.estimate_job(j, bl_cached["model"])
+                if j["state"] in PENDING and j.get("live"):
+                    j["wait_est"] = sched.estimate_job(j, bl_cached["model"])
 
         return {"name": name, "ok": True, "error": None, "warnings": warnings,
-                "load_private": load_private,
+                "load_private": load_private, "scheduler": sched.kind,
+                "features": sorted(sched.features), "qos_label": sched.qos_label,
                 "backlog": bl_cached["result"] if bl_cached else None,
                 "jobs": jobs, "qos": self.build_qos_table(c, jobs, cached, load, with_load)}
 
@@ -893,8 +746,28 @@ def api_status():
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
     """把一次刷新放进后台队列，马上返回（不等 SSH）"""
-    queued = backend.enqueue_refresh(force=True)
+    queued = backend.enqueue_refresh(force=True, manual=True)
     return jsonify({"ok": True, "queued": queued})
+
+
+@app.route("/api/history")
+def api_history():
+    """排队历史（从 waitlog/jobs.csv）：?days=30&cluster=&qos=&q="""
+    if not backend.waitlog:
+        return jsonify({"ok": False, "error": L("没开 waitlog（config.yaml 里 waitlog: false）",
+                                                "waitlog is off (waitlog: false in config.yaml)")})
+    try:
+        days = float(request.args.get("days") or 0) or None
+    except ValueError:
+        days = None
+    h = backend.waitlog.history(days=days, cluster=request.args.get("cluster", ""),
+                                qos=request.args.get("qos", ""),
+                                search=request.args.get("q", "").strip())
+    backups = waitlog.list_backups(backend.backup_dir)
+    h.update({"ok": True, "last_backup": backups[-1][0].isoformat() if backups else None,
+              "n_backups": len(backups),
+              "backup_days": backend.config.get("waitlog_backup_days", 7)})
+    return jsonify(h)
 
 
 @app.route("/api/inspect", methods=["POST"])

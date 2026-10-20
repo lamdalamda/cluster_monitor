@@ -7,3 +7,4 @@ __pycache__/
 waitlog/*.csv
 waitlog/*.old
 waitlog/*.tmp
+waitlog_backups/

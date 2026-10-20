@@ -1,6 +1,6 @@
 # HPC Job Dashboard 配置文件
 #
-# clusters 下每一项对应一个 Slurm 集群。ssh_host 建议使用你 ~/.ssh/config 里
+# clusters 下每一项对应一个集群（Slurm 或 SGE，见下面的 scheduler）。ssh_host 建议使用你 ~/.ssh/config 里
 # 已经配置好的 Host 别名（这样 ProxyJump / IdentityFile / 端口跳板机等设置
 # 都会自动生效，不用在这里重复配置）。
 #
@@ -16,6 +16,19 @@
 # 能正常用；过期了网页上会显示"需要 2FA"，在终端里手动 ssh 登录一次再点"立即刷新"。
 #
 # backlog（可选）：设成 false 就不对这个集群做排队积压估计（默认开）。
+#
+# scheduler（可选）：slurm（默认）或 sge（Son of Grid Engine，比如旧的 MMM Hub Young）。
+#   各调度系统能做到的功能不一样，SGE 没有 QoS 限额 / 预计开始时间 / 排队积压，
+#   QoS 面板按 project（Free / Gold）分组。SGE 已经结束的 job 从 accounting 文件读：
+#   accounting_file（默认 $SGE_ROOT/$SGE_CELL/common/accounting）、
+#   accounting_tail_mb（只读文件最后多少 MB，默认 30）。
+#
+# disable（可选）：关掉这个集群的某些功能，比如看不到别人 job 的集群：
+#   disable: [cluster_load, backlog]
+#   可选：history（已结束的 job）、cluster_load（全集群统计）、qos_info（QoS 限额）、
+#   backlog（排队积压）、est_start（预计开始时间）
+#
+# inspect_files（可选）：这个集群单独用的输出文件模式，覆盖下面全局的 inspect_files。
 
 #
 # qos（可选）：想在 QoS 面板里看哪些 QoS。不写的话会自动用
@@ -36,10 +49,14 @@ clusters:
     ssh_host: clusterB
     enabled: true
 
-  # 用完就删或者 enabled: false
+  # SGE 集群的例子（用完就删或者 enabled: false）
   # - name: OldSGE
   #   ssh_host: sge-login
+  #   scheduler: sge
   #   enabled: false
+  #   inspect_files:
+  #     - vasp.out
+  #     - "*.o{id}"       # SGE 的输出文件：job名.o12345
 
 # 刷新方式：默认不自动刷新，网页上点"立即刷新"才去 SSH 拉数据。
 # 网页和 SSH 是解耦的：打开网页立刻显示上一次的数据（存在 .dashboard_cache.json），
@@ -60,6 +77,14 @@ inspect_tail_lines: 30
 dir_size_warn_gb: 30
 # 目录里的文件/子目录超过这么多个也报警（0 = 不报）
 dir_files_warn: 50
+# 目录里有 OUTCAR 时看最后一个电子步的 LOOP 时间（显示在离子步旁边），
+# 还在跑的 job 满足任一条件就在"提醒"里报警：
+#   real time > loop_warn_ratio × cpu time 且 real time > cpu time + loop_warn_extra_seconds
+#   （在等通信 / IO，可能节点有问题）；或者 real time > loop_warn_real_seconds（单步太慢，0 = 不查）
+loop_file: OUTCAR
+loop_warn_ratio: 1.1
+loop_warn_extra_seconds: 5
+loop_warn_real_seconds: 1000
 # du 的超时（秒），lustre 上目录很大时 du 可能很慢；设 0 = 不查大小
 dir_size_timeout_seconds: 20
 
@@ -87,6 +112,14 @@ auth_retry_minutes: 10
 # 最终等了多久写进 waitlog_dir 下的 csv（相对 app.py 所在目录），以后用来建预测模型
 waitlog: true
 waitlog_dir: waitlog
+# waitlog 文件夹超过这么多 MB 就不再写入，并在页面顶部"提醒"里报警（0 = 不限）
+waitlog_max_mb: 500
+# 定期备份 waitlog：点"立即刷新"时，如果最新的备份已经超过 waitlog_backup_days 天
+# （或者还没有备份），就把 waitlog 打包成 waitlog_backup_dir/waitlog-时间.tar.gz，
+# 只保留最新的 waitlog_backup_keep 份。自动刷新不会触发备份。0 = 不备份
+waitlog_backup_days: 7
+waitlog_backup_keep: 10
+waitlog_backup_dir: waitlog_backups
 
 # SSH 单次命令超时（秒）
 ssh_timeout_seconds: 15
