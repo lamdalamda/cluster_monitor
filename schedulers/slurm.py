@@ -55,7 +55,9 @@ QOS_LIMIT_FORMAT = "Name,MaxJobsPU,MaxSubmitPU,MaxWall,MaxTRESPU"
 class Slurm(Scheduler):
     kind = "slurm"
     qos_label = "QoS"
-    FEATURES = frozenset({"history", "cluster_load", "qos_info", "backlog", "est_start"})
+    PARTITION_LOAD = True
+    FEATURES = frozenset({"history", "cluster_load", "qos_info", "backlog", "est_start",
+                          "partition_info"})
 
     def steps(self, want):
         steps = [("SQUEUE", f"squeue --me -h -o '{SQUEUE_FORMAT}'")]
@@ -63,8 +65,11 @@ class Slurm(Scheduler):
             steps.append(("SACCT", f"sacct -X --starttime=now-{want['history_hours']}hours "
                                    f"-o {SACCT_FORMAT} --parsable2 --noheader"))
         if want.get("load"):
-            # 全集群（所有用户）每个 QoS 的 running/pending 数，用来判断哪里比较空
-            steps.append(("LOAD", "squeue -h -t RUNNING,PENDING -o '%q|%T' | sort | uniq -c"))
+            # 全集群（所有用户）每个 QoS × 分区的 running/pending 数，用来判断哪里比较空
+            steps.append(("LOAD", "squeue -h -t RUNNING,PENDING -o '%q|%P|%T' | sort | uniq -c"))
+        if want.get("partition_info"):
+            # 分区|可用|时限|节点 已用/空闲/其他/总数|CPU 已用/空闲/其他/总数
+            steps.append(("PART", "sinfo -h -o '%P|%a|%l|%F|%C'"))
         if want.get("qos_info"):
             steps.append(("ASSOC", "sacctmgr -nP show assoc user=$USER format=qos"))
             steps.append(("QOS", f"sacctmgr -nP show qos format={QOS_LIMIT_FORMAT}"))
@@ -75,6 +80,9 @@ class Slurm(Scheduler):
 
     def required_sections(self):
         return {"SQUEUE", "SACCT"} if self.has("history") else {"SQUEUE"}
+
+    def optional_sections(self):
+        return {"PART"}  # 比如 bluebear：slurm_load_node: Access/permission denied
 
     def parse_jobs(self, sections, prev_jobs):
         name = self.cluster["name"]
@@ -91,8 +99,24 @@ class Slurm(Scheduler):
         return jobs
 
     def parse_load(self, sections):
-        """'  3506 freecpu|PENDING' -> {"freecpu": {"running": 0, "pending": 3506}}"""
-        return parse_load(sections.get("LOAD", []))
+        """'  3506 freecpu|cpu|PENDING' -> {"freecpu": {"running": 0, "pending": 3506}}"""
+        return parse_load(sections.get("LOAD", []), by="qos")
+
+    def parse_partition_load(self, sections):
+        return parse_load(sections.get("LOAD", []), by="partition")
+
+    def parse_partitions(self, sections):
+        if "PART" not in sections:
+            return None
+        out = []
+        for line in sections["PART"]:
+            parts = line.split("|")
+            if len(parts) != 5:
+                continue
+            name, avail, limit, nodes, cpus = parts
+            out.append({"name": name.rstrip("*"), "default": name.endswith("*"), "avail": avail,
+                        "time_limit": limit, "nodes": split_counts(nodes), "cpus": split_counts(cpus)})
+        return out or None
 
     def parse_qos_info(self, sections):
         return {"assoc": parse_assoc(sections.get("ASSOC", [])),
@@ -187,20 +211,30 @@ def parse_sacct(lines, cluster_name):
     return jobs
 
 
-def parse_load(lines):
-    """'  3506 freecpu|PENDING' -> {"freecpu": {"running": 0, "pending": 3506}}"""
+def parse_load(lines, by="qos"):
+    """'  3506 freecpu|cpu|PENDING' -> 按 QoS 或按分区数 running/pending。
+    排队中的 job 的分区可能是 'a,b,c'（哪个先有空位就去哪），按分区数时每个都算一次"""
     load = {}
     for line in lines:
-        m = re.match(r"(\d+)\s+(.*)\|(\w+)$", line)
+        m = re.match(r"(\d+)\s+(.*)\|(.*)\|(\w+)$", line)
         if not m:
             continue
-        count, qos, state = int(m.group(1)), m.group(2), m.group(3)
-        entry = load.setdefault(qos, {"running": 0, "pending": 0})
-        if state == "RUNNING":
-            entry["running"] += count
-        elif state == "PENDING":
-            entry["pending"] += count
+        count, qos, parts, state = int(m.group(1)), m.group(2), m.group(3), m.group(4)
+        for key in ([qos] if by == "qos" else [p for p in parts.split(",") if p]):
+            entry = load.setdefault(key, {"running": 0, "pending": 0})
+            if state == "RUNNING":
+                entry["running"] += count
+            elif state == "PENDING":
+                entry["pending"] += count
     return load
+
+
+def split_counts(s):
+    """sinfo 的 'A/I/O/T' -> {"alloc", "idle", "other", "total"}"""
+    vals = s.split("/")
+    if len(vals) != 4 or not all(v.isdigit() for v in vals):
+        return None
+    return dict(zip(("alloc", "idle", "other", "total"), map(int, vals)))
 
 
 def parse_assoc(lines):

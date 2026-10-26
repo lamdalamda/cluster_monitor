@@ -26,7 +26,7 @@
 # disable（可选）：关掉这个集群的某些功能，比如看不到别人 job 的集群：
 #   disable: [cluster_load, backlog]
 #   可选：history（已结束的 job）、cluster_load（全集群统计）、qos_info（QoS 限额）、
-#   backlog（排队积压）、est_start（预计开始时间）
+#   backlog（排队积压）、est_start（预计开始时间）、partition_info（分区表里的节点 / CPU，sinfo）
 #
 # inspect_files（可选）：这个集群单独用的输出文件模式，覆盖下面全局的 inspect_files。
 

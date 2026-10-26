@@ -18,6 +18,7 @@ Backend（app.py）只管 SSH、缓存、合并结果、给前端的数据；每
 - qos_info      能用哪些 QoS 和它们的限额（sacctmgr）
 - backlog       排队积压估计（backlog.py，要看到全集群的 job 和分区）
 - est_start     调度器自己估计的开始时间
+- partition_info 每个分区的节点 / CPU 用量和时限（sinfo）
 """
 
 import re
@@ -26,12 +27,13 @@ from abc import ABC, abstractmethod
 ACTIVE = {"RUNNING", "COMPLETING", "CONFIGURING"}
 PENDING = {"PENDING", "SUSPENDED", "REQUEUED", "REQUEUE_HOLD", "RESV_DEL_HOLD"}
 
-ALL_FEATURES = {"history", "cluster_load", "qos_info", "backlog", "est_start"}
+ALL_FEATURES = {"history", "cluster_load", "qos_info", "backlog", "est_start", "partition_info"}
 
 
 class Scheduler(ABC):
     kind = ""            # config.yaml 里 scheduler: 的值
     qos_label = "QoS"    # 前端 QoS 面板的列名
+    PARTITION_LOAD = False  # parse_partition_load 能给出全集群按分区的数字
     FEATURES = frozenset()
 
     def __init__(self, cluster, config):
@@ -52,8 +54,9 @@ class Scheduler(ABC):
     @abstractmethod
     def steps(self, want):
         """这次 SSH 要跑的命令 [(SECTION, cmd), ...]，SECTION 全大写。
-        want: {"history_hours": int, "load": bool, "qos_info": bool, "backlog": bool}
-        （load / qos_info / backlog 只在 has() 为真时才会是 True）"""
+        want: {"history_hours": int, "load": bool, "qos_info": bool, "backlog": bool,
+               "partition_info": bool}
+        （load / qos_info / backlog / partition_info 只在 has() 为真时才会是 True）"""
 
     @abstractmethod
     def required_sections(self):
@@ -75,6 +78,19 @@ class Scheduler(ABC):
     def parse_load(self, sections):
         """{qos: {"running": n, "pending": n}}"""
         return {}
+
+    def parse_partition_load(self, sections):
+        """{分区: {"running": n, "pending": n}}（排队中的 job 可以同时排在好几个分区，每个都算）"""
+        return {}
+
+    def parse_partitions(self, sections):
+        """[{"name", "default", "avail", "time_limit", "nodes": {alloc, idle, other, total},
+            "cpus": {alloc, idle, other, total}}]；拿不到返回 None"""
+        return None
+
+    def optional_sections(self):
+        """失败了也不在页面上报错的段（比如有的集群不让用 sinfo，卡片里会说明）"""
+        return set()
 
     def parse_qos_info(self, sections):
         """{"assoc": [能用的 QoS], "limits": {qos: {max_jobs_pu, max_submit_pu, max_wall, max_tres_pu}}}"""

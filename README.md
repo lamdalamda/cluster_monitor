@@ -156,6 +156,12 @@ config.yaml: `sudo systemctl restart hpc-dashboard`. Stop any manually started
     `loop_warn_extra_seconds`, `loop_warn_real_seconds`
   - click a job id to jump to it, click a path to copy it
 
+- **Partitions** (between QoS and backlog): per partition your running / pending, all users'
+  running / pending, nodes and CPUs allocated / idle / total (`sinfo -o '%P|%a|%l|%F|%C'`) and
+  the time limit; click a row to filter the jobs (click the chip next to "Jobs" to clear).
+  A pending job that lists several partitions is counted in each. Clusters that forbid
+  `sinfo` (bluebear) only show your own column
+
 ### Schedulers (Slurm / SGE)
 
 Each cluster in `config.yaml` can set `scheduler: slurm` (default) or `scheduler: sge`.
@@ -171,6 +177,7 @@ Every scheduler is a subclass of `schedulers/base.py:Scheduler` (`schedulers/slu
 | QoS list & limits (`qos_info`) | sacctmgr | — (QoS panel groups by project, no limit columns) |
 | backlog estimate (`backlog`) | squeue + sinfo | — |
 | scheduler's estimated start (`est_start`) | squeue | — |
+| partition nodes / CPUs (`partition_info`) | sinfo | — (partition table groups your jobs by PE) |
 
 Turn features off per cluster with `disable: [cluster_load, backlog]`, e.g. for a cluster
 that hides other users' jobs (this is also auto-detected: if the cluster-wide counts equal
@@ -334,6 +341,11 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
     `loop_warn_ratio`、`loop_warn_extra_seconds`、`loop_warn_real_seconds`
   - 点 job id 跳过去，点路径复制
 
+- **分区**（在 QoS 和排队积压之间）：每个分区 你的 运行 / 排队、所有用户的 运行 / 排队、
+  节点和 CPU 的 已用 / 空闲 / 总数（`sinfo -o '%P|%a|%l|%F|%C'`）和时限；点一行按分区筛选
+  下面的 job（点 "Jobs" 旁边的标签取消）。排队时写了好几个分区的 job 每个分区都算一次。
+  不让用 `sinfo` 的集群（bluebear）只显示你自己那一列
+
 ### 调度系统（Slurm / SGE）
 
 `config.yaml` 里每个集群可以写 `scheduler: slurm`（默认）或 `scheduler: sge`。
@@ -348,6 +360,7 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
 | QoS 和限额（`qos_info`） | sacctmgr | 没有（QoS 面板按 project 分组，不显示限额列） |
 | 排队积压（`backlog`） | squeue + sinfo | 没有 |
 | 调度器预计开始时间（`est_start`） | squeue | 没有 |
+| 分区的节点 / CPU（`partition_info`） | sinfo | 没有（分区表按你的 job 的 PE 统计） |
 
 单个集群可以用 `disable: [cluster_load, backlog]` 关掉某些功能，比如看不到别人 job 的集群
 （这个也会自动识别：全集群数字和你自己的一样时显示为"隐藏"）。SGE 没有 eligible

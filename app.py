@@ -504,7 +504,7 @@ class Backend:
                     "load_private": r.get("load_private", False), "qos": r.get("qos", []),
                     "scheduler": r.get("scheduler", "slurm"), "qos_label": r.get("qos_label", "QoS"),
                     "features": r.get("features", sorted(schedulers.ALL_FEATURES)),
-                    "backlog": r.get("backlog"),
+                    "backlog": r.get("backlog"), "partitions": r.get("partitions"),
                 })
             errors.extend(as_l(e) for e in self.results.get("_errors", {}).values())
             inspect, pending = self.inspect_view(jobs)
@@ -620,7 +620,8 @@ class Backend:
             or now - bl_cached["fetched_at"] > cfg.get("backlog_refresh_minutes", 5) * 60
         )
         steps = sched.steps({"history_hours": cfg.get("history_hours", 48), "load": with_load,
-                             "qos_info": with_qos_info, "backlog": with_backlog})
+                             "qos_info": with_qos_info, "backlog": with_backlog,
+                             "partition_info": sched.has("partition_info")})
 
         timeout_total = timeout * (2 if with_backlog else 1)
         try:
@@ -645,8 +646,10 @@ class Backend:
             names = "/".join(sorted(x.lower() for x in required))
             return {"name": name, "ok": False, "error": err[-300:] or L(f"{names} 都失败了", f"{names} all failed"),
                     "warnings": [], "jobs": {}, "qos": []}
+        quiet = sched.optional_sections()
         for sec in sorted(failed):
-            if not sec.startswith("BL_"):  # 积压分析失败会在积压面板里说明，这里不重复报
+            # 积压分析 / 分区信息失败会在各自的面板里说明，这里不重复报
+            if not sec.startswith("BL_") and sec not in quiet:
                 warnings.append(L(f"{sec.lower()} 命令失败", f"{sec.lower()} command failed"))
 
         with self.lock:
@@ -659,13 +662,15 @@ class Backend:
         if not sched.has("qos_info"):
             cached = {"assoc": [], "limits": {}}
         load = sched.parse_load(sections) if with_load else {}
+        part_load = sched.parse_partition_load(sections) if with_load else {}
+        part_info = sched.parse_partitions(sections) if sched.has("partition_info") else None
         # 有的集群（比如 PrivateData=jobs）只能看到自己的 job，
         # 这时"全集群"数字其实就是你自己的，没有参考价值，标记一下前端显示为隐藏
         mine_active = sum(1 for j in jobs.values() if j["state"] in ACTIVE | PENDING)
         load_total = sum(v["running"] + v["pending"] for v in load.values())
         load_private = with_load and load_total == mine_active
         if load_private:
-            load, with_load = {}, False
+            load, part_load, with_load = {}, {}, False
 
         if with_backlog:
             try:
@@ -685,7 +690,30 @@ class Backend:
                 "load_private": load_private, "scheduler": sched.kind,
                 "features": sorted(sched.features), "qos_label": sched.qos_label,
                 "backlog": bl_cached["result"] if bl_cached else None,
-                "jobs": jobs, "qos": self.build_qos_table(c, jobs, cached, load, with_load)}
+                "jobs": jobs, "qos": self.build_qos_table(c, jobs, cached, load, with_load),
+                "partitions": self.build_partition_table(jobs, part_info, part_load,
+                                                         with_load and sched.PARTITION_LOAD)}
+
+    @staticmethod
+    def build_partition_table(jobs, info, load, with_load):
+        """分区表：sinfo 里的分区（按 sinfo 的顺序）+ 你的 job 用到、但 sinfo 里没有的分区。
+        info=None 表示拿不到 sinfo（不支持 / 没权限），这时只有"我的"那一列"""
+        mine = {}
+        for j in jobs.values():
+            if j["state"] not in ACTIVE | PENDING:
+                continue
+            for p in [p for p in (j.get("partition") or "").split(",") if p] or ["-"]:
+                m = mine.setdefault(p, {"running": 0, "pending": 0})
+                m["running" if j["state"] in ACTIVE else "pending"] += 1
+        rows = [dict(r) for r in info or []]
+        seen = {r["name"] for r in rows}
+        rows += [{"name": p} for p in sorted(mine) if p not in seen]
+        for r in rows:
+            m, a = mine.get(r["name"], {}), load.get(r["name"], {})
+            r.update({"mine_running": m.get("running", 0), "mine_pending": m.get("pending", 0),
+                      "all_running": a.get("running", 0) if with_load else None,
+                      "all_pending": a.get("pending", 0) if with_load else None})
+        return {"info": info is not None, "rows": rows}
 
     @staticmethod
     def build_qos_table(c, jobs, cached, load, with_load):

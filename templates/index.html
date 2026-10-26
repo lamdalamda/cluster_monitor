@@ -29,7 +29,7 @@
   .errbox div{word-break:break-all;}
 
   /* QoS 面板 */
-  #qosGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:12px;margin-bottom:18px;}
+  #qosGrid, #partGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:12px;margin-bottom:18px;}
   .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow-x:auto;}
   .card-h{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);font-weight:600;}
   .card-h .muted{font-weight:400;}
@@ -47,6 +47,10 @@
   .qos .tres{white-space:normal;word-break:break-all;min-width:110px;font-size:12px;}
   .qos tr.full td.mine{color:var(--warn);}
   .qos tr.subfull td.mine{color:var(--bad);}
+  .qos tr.down td.qname{color:#ff9d9d;}
+  .qos tr.mine-row td.qname{font-weight:600;}
+  .qos .idle-n{color:var(--ok);}
+  #partChip{cursor:pointer;}
   .n-r{color:var(--ok);} .n-pd{color:var(--warn);} .n-0{color:#4a5063;}
   .tag{display:inline-block;font-size:10px;padding:0 5px;border-radius:3px;margin-left:5px;vertical-align:1px;}
   .tag.full{background:#4a3b10;color:var(--warn);} .tag.subfull{background:#4a1c1c;color:#ff9d9d;}
@@ -156,7 +160,7 @@
   @media (max-width:640px){
     header{padding:8px 16px;} main{padding:12px 16px 40px;}
     input[type=text]{width:100%;}
-    #qosGrid{grid-template-columns:1fr;}
+    #qosGrid, #partGrid{grid-template-columns:1fr;}
     .card{overflow-x:auto;}
   }
 </style>
@@ -193,6 +197,10 @@
     <span class="muted" data-i18n="qos_hint"></span></h2>
   <div id="qosGrid"></div>
 
+  <h2><span data-i18n="part_title"></span> <button id="partToggle"></button>
+    <span class="muted" data-i18n="part_hint"></span></h2>
+  <div id="partGrid"></div>
+
   <h2><span data-i18n="bl_title"></span> <button id="blToggle"></button>
     <span class="muted" data-i18n="bl_hint"></span></h2>
   <details class="how"><summary data-i18n="bl_how"></summary><div data-i18n-html="bl_how_body"></div></details>
@@ -200,6 +208,7 @@
   <div id="blNote" class="muted" style="margin:-8px 0 18px"></div>
 
   <h2>Jobs <button id="expandAll" data-i18n="expand_all"></button><button id="collapseAll" data-i18n="collapse_all"></button>
+    <span class="tag cfg" id="partChip" style="display:none"></span>
     <span class="muted" data-i18n="jobs_hint"></span></h2>
   <div class="tablewrap">
     <table id="jobs">
@@ -295,6 +304,12 @@ const I18N = {
     bg: "后台：", bg_working: "处理中", bg_steps: (d, n) => `（${d}/${n} 步）`, bg_more: n => ` · 还有 ${n} 个任务`,
     server_down: "连不上本机的 dashboard 服务",
     al_waitlog_full: "waitlog 已满", al_slow_loop: "LOOP 太慢", loop_slow: "慢",
+    part_title: "分区", part_hint: "点一行按该分区筛选下面的 job · 我的/全集群 = 运行 / 排队 · 节点、CPU = 已用 / 空闲 / 总数",
+    th_part: "分区", th_nodes: "节点", th_cpus2: "CPU", th_tlimit: "时限",
+    nodes_tip: "已用 / 空闲 / 总数（另有 其他 = 下线或维护中）", part_default: "默认",
+    part_multi_tip: "排队中的 job 可以同时排在好几个分区（哪个先有空位去哪），每个分区都会算一次",
+    part_no_info: c => c.scheduler === "sge" ? "SGE 没有分区信息，只按你的 job 的并行环境（PE）统计" : "这个集群看不到 sinfo（没权限），只统计你自己的 job",
+    part_chip: p => `分区：${p} ✕`,
     al_waitlog_full_msg: (s, l) => `${s} MB > ${l} MB，已停止写入等待时间数据。清理或归档这个文件夹，或调大 config.yaml 里的 waitlog_max_mb：`,
     hist_title: "排队历史", hist_hint: "来自 waitlog/jobs.csv · 等待 = 开始 − 可以开始排队（依赖满足）的时间 · 点统计表一行筛选下面的 job",
     hist_d7: "最近 7 天", hist_d30: "最近 30 天", hist_d90: "最近 90 天", hist_d365: "最近一年", hist_dall: "全部",
@@ -366,6 +381,12 @@ const I18N = {
     bg: "Background: ", bg_working: "working", bg_steps: (d, n) => ` (${d}/${n} steps)`, bg_more: n => ` · ${n} more queued`,
     server_down: "Can't reach the local dashboard server",
     al_waitlog_full: "waitlog full", al_slow_loop: "slow LOOP", loop_slow: "slow",
+    part_title: "Partitions", part_hint: "Click a row to filter jobs by that partition · Mine / Cluster = running / pending · Nodes, CPUs = allocated / idle / total",
+    th_part: "Partition", th_nodes: "Nodes", th_cpus2: "CPUs", th_tlimit: "Time limit",
+    nodes_tip: "allocated / idle / total (other = down or drained)", part_default: "default",
+    part_multi_tip: "A pending job can queue in several partitions at once (it goes wherever frees up first); it is counted in each",
+    part_no_info: c => c.scheduler === "sge" ? "SGE has no partition info; grouped by the parallel environment (PE) of your jobs" : "sinfo isn't allowed on this cluster; only your own jobs are counted",
+    part_chip: p => `Partition: ${p} ✕`,
     al_waitlog_full_msg: (s, l) => `${s} MB > ${l} MB, stopped writing wait-time data. Clean up or archive the folder, or raise waitlog_max_mb in config.yaml: `,
     hist_title: "Queue history", hist_hint: "From waitlog/jobs.csv · wait = start − eligible (dependencies met) · click a summary row to filter the jobs below",
     hist_d7: "Last 7 days", hist_d30: "Last 30 days", hist_d90: "Last 90 days", hist_d365: "Last year", hist_dall: "All",
@@ -423,10 +444,11 @@ const localTime = iso => iso ? new Date(iso).toLocaleTimeString([], {hour: "2-di
 
 // ---- 本地记住的界面状态（只是个人偏好，丢了也没关系）----
 let expanded = new Set(loadPref("expanded", []).map(k => k.replace("\u0000", "/")));
-let filters = Object.assign({cluster:"", qos:"", state:"", search:""}, loadPref("filters", {}));
+let filters = Object.assign({cluster:"", qos:"", part:"", state:"", search:""}, loadPref("filters", {}));
 filters.search = "";
 let qosCollapsed = loadPref("qosCollapsed", false);
 let blCollapsed = loadPref("blCollapsed", false);
+let partCollapsed = loadPref("partCollapsed", false);
 let detailOpen = new Set();      // 展开了"详情"（ls + tail 全文）的 job
 let requested = new Set();       // 这次打开页面已经请求过读取目录的 job
 let pendingInspect = new Set();
@@ -468,6 +490,10 @@ function groupVisible(g){
   if (filters.qos){
     const [c, q] = filters.qos.split("|");
     if (g.cluster !== c || !g.jobs.some(j => j.qos === q)) return false;
+  }
+  if (filters.part){
+    const [c, p] = filters.part.split("|");
+    if (g.cluster !== c || !g.jobs.some(j => (j.partition || "").split(",").includes(p))) return false;
   }
   const s = g.rep.state;
   switch (filters.state){
@@ -724,6 +750,43 @@ function renderQos(){
   }).join("");
 }
 
+function renderPartitions(){
+  const grid = document.getElementById("partGrid");
+  grid.style.display = partCollapsed ? "none" : "";
+  document.getElementById("partToggle").textContent = partCollapsed ? t("expand") : t("collapse");
+  const chip = document.getElementById("partChip");
+  chip.style.display = filters.part ? "" : "none";
+  chip.textContent = filters.part ? t("part_chip", filters.part.replace("|", " / ")) : "";
+  const n = (v, cls) => v === null || v === undefined ? `<span class="n-0">—</span>` : `<span class="${v ? cls : "n-0"}">${v}</span>`;
+  const cnt = x => !x ? `<span class="n-0">—</span>`
+    : `${x.alloc} / <span class="${x.idle ? "idle-n" : "n-0"}">${x.idle}</span> / ${x.total}${x.other ? ` <span class="muted" title="${esc(t("nodes_tip"))}">(+${x.other})</span>` : ""}`;
+  grid.innerHTML = (lastData.clusters || []).filter(c => c.partitions && c.partitions.rows.length).map(c => {
+    const P = c.partitions, info = P.info;
+    const load = !c.load_private && P.rows.some(r => r.all_running !== null && r.all_running !== undefined);
+    const dot = `<span class="dot" style="--c:${c.ok ? "var(--ok)" : c.need_input ? "var(--warn)" : "var(--bad)"}"></span>`;
+    const rows = P.rows.map(r => {
+      const key = c.name + "|" + r.name;
+      const mine = r.mine_running || r.mine_pending;
+      const down = r.avail && r.avail !== "up";
+      return `<tr class="${filters.part === key ? "sel" : ""} ${mine ? "mine-row" : "idle"} ${down ? "down" : ""}" data-part="${esc(key)}">
+        <td class="qname">${esc(r.name)}${r.default ? `<span class="tag cfg">${t("part_default")}</span>` : ""}${down ? `<span class="tag subfull">${esc(r.avail)}</span>` : ""}</td>
+        <td class="mine" title="${esc(t("part_multi_tip"))}">${n(r.mine_running, "n-r")} / ${n(r.mine_pending, "n-pd")}</td>
+        ${load ? `<td title="${esc(t("part_multi_tip"))}">${n(r.all_running, "n-r")} / ${n(r.all_pending, "n-pd")}</td>` : ""}
+        ${info ? `<td title="${esc(t("nodes_tip"))}">${cnt(r.nodes)}</td><td title="${esc(t("nodes_tip"))}">${cnt(r.cpus)}</td>
+        <td class="lim">${esc(r.time_limit || "-")}</td>` : ""}
+      </tr>`;
+    }).join("");
+    return `<div class="card">
+      <div class="card-h">${dot}${esc(c.name)}<span class="muted at">${c.ok ? t("data_at", localTime(c.at)) : ""}</span></div>
+      ${info ? "" : `<div class="stale-note" style="color:var(--muted)">${esc(t("part_no_info", c))}</div>`}
+      <table class="qos">
+        <thead><tr><th>${t("th_part")}</th><th>${t("th_mine")}</th>${load ? `<th>${t("th_all")}</th>` : ""}
+          ${info ? `<th title="${esc(t("nodes_tip"))}">${t("th_nodes")}</th><th title="${esc(t("nodes_tip"))}">${t("th_cpus2")}</th><th>${t("th_tlimit")}</th>` : ""}</tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>`;
+  }).join("");
+}
+
 function renderBacklog(){
   const grid = document.getElementById("blGrid");
   grid.style.display = blCollapsed ? "none" : "";
@@ -823,10 +886,16 @@ function render(){
   jobsByKey = {};
   lastData.jobs.forEach(j => jobsByKey[jobKey(j)] = j);
   pendingInspect = new Set(lastData.inspect_pending || []);
-  renderFilters(); renderAlerts(); renderErrors(); renderQos(); renderBacklog(); renderJobs(); renderUpdated();
+  renderFilters(); renderAlerts(); renderErrors(); renderQos(); renderPartitions(); renderBacklog(); renderJobs(); renderUpdated();
 }
 
 function setFilter(k, v){ filters[k] = v; savePref("filters", {...filters, search: ""}); render(); }
+document.getElementById("partGrid").addEventListener("click", e => {
+  const row = e.target.closest("tr[data-part]");
+  if (row) setFilter("part", filters.part === row.dataset.part ? "" : row.dataset.part);
+});
+document.getElementById("partChip").addEventListener("click", () => setFilter("part", ""));
+document.getElementById("partToggle").addEventListener("click", () => { partCollapsed = !partCollapsed; savePref("partCollapsed", partCollapsed); renderPartitions(); });
 
 // ---------------- 排队历史 ----------------
 let histCollapsed = loadPref("histCollapsed", true);
