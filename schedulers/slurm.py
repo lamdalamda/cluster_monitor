@@ -70,6 +70,8 @@ class Slurm(Scheduler):
         if want.get("partition_info"):
             # 分区|可用|时限|节点 已用/空闲/其他/总数|CPU 已用/空闲/其他/总数
             steps.append(("PART", "sinfo -h -o '%P|%a|%l|%F|%C'"))
+            # 每个分区允许哪些 QoS、分区自己的 QoS、总节点/核数（有的集群不让 sinfo，但让 scontrol）
+            steps.append(("PINFO", "scontrol show partition -o"))
         if want.get("qos_info"):
             steps.append(("ASSOC", "sacctmgr -nP show assoc user=$USER format=qos"))
             steps.append(("QOS", f"sacctmgr -nP show qos format={QOS_LIMIT_FORMAT}"))
@@ -82,7 +84,7 @@ class Slurm(Scheduler):
         return {"SQUEUE", "SACCT"} if self.has("history") else {"SQUEUE"}
 
     def optional_sections(self):
-        return {"PART"}  # 比如 bluebear：slurm_load_node: Access/permission denied
+        return {"PART", "PINFO"}  # 比如 bluebear：sinfo 报 slurm_load_node: Access/permission denied
 
     def parse_jobs(self, sections, prev_jobs):
         name = self.cluster["name"]
@@ -102,21 +104,41 @@ class Slurm(Scheduler):
         """'  3506 freecpu|cpu|PENDING' -> {"freecpu": {"running": 0, "pending": 3506}}"""
         return parse_load(sections.get("LOAD", []), by="qos")
 
-    def parse_partition_load(self, sections):
-        return parse_load(sections.get("LOAD", []), by="partition")
+    def parse_combo_load(self, sections):
+        return parse_load(sections.get("LOAD", []), by="combo")
 
     def parse_partitions(self, sections):
-        if "PART" not in sections:
-            return None
-        out = []
-        for line in sections["PART"]:
+        """scontrol（规则、总数，顺序以它为准）+ sinfo（已用 / 空闲）；两个都拿不到返回 None"""
+        rows = {}
+        for line in sections.get("PINFO", []):
+            kv = dict(tok.split("=", 1) for tok in line.split() if "=" in tok)
+            name = kv.get("PartitionName")
+            if not name:
+                continue
+            allow = kv.get("AllowQos", "ALL")
+            rows[name] = {
+                "name": name, "default": kv.get("Default") == "YES",
+                "avail": kv.get("State", "").lower(),
+                "time_limit": "infinite" if kv.get("MaxTime") == "UNLIMITED" else kv.get("MaxTime", ""),
+                "nodes": {"total": int(kv["TotalNodes"])} if kv.get("TotalNodes", "").isdigit() else None,
+                "cpus": {"total": int(kv["TotalCPUs"])} if kv.get("TotalCPUs", "").isdigit() else None,
+                "allow_qos": None if allow in ("ALL", "") else allow.split(","),
+                "deny_qos": [] if kv.get("DenyQos", "") in ("", "(null)") else kv["DenyQos"].split(","),
+                "part_qos": "" if kv.get("QoS", "N/A") == "N/A" else kv["QoS"],
+            }
+        for line in sections.get("PART", []):
             parts = line.split("|")
             if len(parts) != 5:
                 continue
             name, avail, limit, nodes, cpus = parts
-            out.append({"name": name.rstrip("*"), "default": name.endswith("*"), "avail": avail,
-                        "time_limit": limit, "nodes": split_counts(nodes), "cpus": split_counts(cpus)})
-        return out or None
+            name, default = name.rstrip("*"), name.endswith("*")
+            row = rows.setdefault(name, {"name": name, "allow_qos": None, "deny_qos": [], "part_qos": ""})
+            row.update({"default": default or row.get("default", False), "avail": avail,
+                        "time_limit": limit or row.get("time_limit", "")})
+            # sinfo 有已用 / 空闲就用 sinfo 的，没有就保留 scontrol 的总数
+            row["nodes"] = split_counts(nodes) or row.get("nodes")
+            row["cpus"] = split_counts(cpus) or row.get("cpus")
+        return list(rows.values()) or None
 
     def parse_qos_info(self, sections):
         return {"assoc": parse_assoc(sections.get("ASSOC", [])),
@@ -212,7 +234,7 @@ def parse_sacct(lines, cluster_name):
 
 
 def parse_load(lines, by="qos"):
-    """'  3506 freecpu|cpu|PENDING' -> 按 QoS 或按分区数 running/pending。
+    """'  3506 freecpu|cpu|PENDING' -> 按 QoS（by="qos"）或按 (QoS, 分区)（by="combo"）数 running/pending。
     排队中的 job 的分区可能是 'a,b,c'（哪个先有空位就去哪），按分区数时每个都算一次"""
     load = {}
     for line in lines:
@@ -220,7 +242,7 @@ def parse_load(lines, by="qos"):
         if not m:
             continue
         count, qos, parts, state = int(m.group(1)), m.group(2), m.group(3), m.group(4)
-        for key in ([qos] if by == "qos" else [p for p in parts.split(",") if p]):
+        for key in ([qos] if by == "qos" else [(qos, p) for p in parts.split(",") if p]):
             entry = load.setdefault(key, {"running": 0, "pending": 0})
             if state == "RUNNING":
                 entry["running"] += count

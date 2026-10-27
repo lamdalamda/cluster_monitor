@@ -1,2 +1,4 @@
 Flask>=3.0
 PyYAML>=6.0
+# 可选：排队等待预测（predictor.py）
+scikit-learn>=1.2

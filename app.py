@@ -23,6 +23,8 @@ HPC Job Dashboard
 有效期内时也能用；过期了会显示"需要输入"，在终端里手动 ssh 登录一次再点"立即刷新"。
 """
 
+import fnmatch
+import ipaddress
 import json
 import os
 import re
@@ -33,21 +35,34 @@ from collections import deque
 from datetime import datetime, timezone
 
 import yaml
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, abort, jsonify, render_template, request
 
 import jobfiles
+import predictor
 import schedulers
 import waitlog
 from i18n import L, as_l, prefixed, suffixed
-from schedulers.base import ACTIVE, PENDING
+from schedulers.base import ACTIVE, PENDING, sort_jobid, waiting_on_dependency
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.yaml")
 EXAMPLE_CONFIG_PATH = os.path.join(APP_DIR, "config.example.yaml")
 ASKPASS = os.path.join(APP_DIR, "ssh_askpass_abort.sh")
 CACHE_PATH = os.path.join(APP_DIR, ".dashboard_cache.json")
+# 网页上改的设置（目前只有自动刷新间隔），比 config.yaml 优先
+SETTINGS_PATH = os.path.join(APP_DIR, ".dashboard_settings.json")
 INSPECT_CHUNK = 8  # 每次 SSH 看几个目录
-MAX_IDS_PER_DIR = 10  # 同一个目录里最多给几个 job 找各自的 slurm 输出文件
+MAX_IDS_PER_DIR = 10
+# 排队原因匹配这些（通配符）= 不改提交脚本 / 不找管理员就永远不会开始，页面顶上告警。
+# config.yaml 里 never_run_reasons 可以改；来源：https://slurm.schedmd.com/job_reason_codes.html
+DEFAULT_NEVER_RUN = [
+    "DependencyNeverSatisfied",  # afterok 的前置 job 失败了之类
+    "BadConstraints", "PartitionTimeLimit", "PartitionNodeLimit",
+    "QOSMax*PerJob*", "AssocMax*PerJob*",  # 单个 job 申请的超过了限额（不是"同时跑的太多"那种）
+    "InvalidAccount", "InvalidQOS", "AccountNotAllowed", "QOSNotAllowed",
+    "JobHeldUser", "JobHeldAdmin", "JobHoldMaxRequeue", "DeadLine", "ReservationDeleted",
+    "Error (*", "Hold (*",  # SGE：Eqw（出错）/ hqw 但没有依赖（被 hold 了）
+]  # 同一个目录里最多给几个 job 找各自的 slurm 输出文件
 
 
 def load_config():
@@ -186,7 +201,22 @@ class Backend:
         if config.get("waitlog", True):
             self.waitlog = waitlog.WaitLog(self.waitlog_dir)
             self.check_waitlog_size()
+        # 排队等待预测（predictor.py）：用 waitlog 训练，网页上点按钮训练 / 更新
+        self.predictor = None
+        if self.waitlog and config.get("wait_model", True):
+            self.predictor = predictor.Predictor(
+                os.path.join(APP_DIR, config.get("wait_model_path", "models/wait_model.pkl")),
+                config.get("wait_model_half_life_days", 14))
         self.load_cache()
+        self.annotate_all()
+        # 自动刷新间隔（分钟，0 = 关）：网页上的下拉框改了存在 SETTINGS_PATH，否则用 config.yaml
+        self.auto_minutes = self.config.get("auto_refresh_minutes", 0) or 0
+        try:
+            with open(SETTINGS_PATH, encoding="utf-8") as f:
+                self.auto_minutes = int(json.load(f).get("auto_refresh_minutes", self.auto_minutes))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        self.auto_wake = threading.Event()  # 改了间隔 / 刷新完成：叫醒自动刷新线程重新算时间
 
     def clusters(self):
         return [c for c in self.config.get("clusters", []) if c.get("enabled", True)]
@@ -321,6 +351,64 @@ class Backend:
             self.batch_done += 1
             self.version += 1
 
+    # ---------------- 排队等待预测 ----------------
+    def annotate(self, r):
+        """标出不会开始的排队 job（never_run = 匹配到的原因），再给其余排队 job 加上
+        模型预测的开始时间（ml_est）"""
+        pats = self.config.get("never_run_reasons", DEFAULT_NEVER_RUN) or []
+        for j in r.get("jobs", {}).values():
+            reason = (j.get("reason") or "").strip("()") if j["state"] in PENDING else ""
+            j["never_run"] = reason if reason and any(fnmatch.fnmatchcase(reason, p) for p in pats) else ""
+        if self.predictor and r.get("jobs"):
+            try:
+                self.predictor.annotate(r)
+            except Exception as e:  # noqa: BLE001  预测出错不影响刷新
+                r.setdefault("warnings", []).append(L(f"等待预测出错: {e}", f"Wait prediction failed: {e}"))
+
+    def annotate_all(self):
+        """模型换了（启动时加载 / 重新训练）：用新模型重新预测现有结果"""
+        with self.lock:
+            # 从缓存读进来时 results 和 last_good 是两份对象（连不上的集群 results 里是旧数据的副本）
+            seen = {}
+            for r in list(self.last_good.values()) + list(self.results.values()):
+                if isinstance(r, dict) and id(r.get("jobs")) not in seen:
+                    seen[id(r.get("jobs"))] = True
+                    self.annotate(r)
+            self.version += 1
+
+    def train_model(self):
+        """在自己的线程里训练（几秒），不占 SSH 队列。返回 False = 已经在训练了"""
+        if not self.predictor or not self.predictor.claim():
+            return False
+        with self.waitlog.lock:
+            rows = [dict(r) for r in self.waitlog.rows.values()]
+
+        def run():
+            ok = self.predictor.train(rows, predictor.Snapshots(self.waitlog_dir))
+            if ok:
+                self.annotate_all()
+            else:
+                with self.lock:
+                    self.version += 1
+        threading.Thread(target=run, daemon=True).start()
+        with self.lock:
+            self.version += 1
+        return True
+
+    def model_status(self):
+        if not self.predictor:
+            return {"enabled": False}
+        st = self.predictor.status()
+        return {"enabled": True, **st, "error": as_l(st["error"]) if st["error"] else None}
+
+    def suggest(self, req):
+        if not self.predictor or not self.predictor.bundle:
+            return []
+        with self.lock:
+            results = {c["name"]: self.last_good[c["name"]] for c in self.clusters()
+                       if c["name"] in self.last_good}
+            return self.predictor.suggest(results, req)
+
     def check_waitlog_size(self):
         """waitlog 文件夹超过上限就停止写入（页面上会提醒）。返回 True = 还能写"""
         limit_mb = self.config.get("waitlog_max_mb", 500) or 0
@@ -362,6 +450,7 @@ class Backend:
             self._step(L(f"刷新 {c['name']}（{i}/{len(clusters)}）",
                          f"Refreshing {c['name']} ({i}/{len(clusters)})"))
             r = self.poll_cluster(c, task.get("force", True))
+            self.annotate(r)
             with self.lock:
                 self.store_result(r)
             if r["ok"] and self.waitlog and self.check_waitlog_size():
@@ -378,6 +467,7 @@ class Backend:
         with self.lock:
             self.last_refresh = now_iso()
             self.results.get("_errors", {}).pop("worker", None)
+        self.auto_wake.set()  # 自动刷新从这次刷新重新计时
 
     def store_result(self, r):
         name = r["name"]
@@ -448,16 +538,42 @@ class Backend:
                 self.inspect_pending.difference_update(dks)
             self._step_done()
 
-    def auto_refresh_loop(self, minutes):
+    def next_auto_refresh(self):
+        """下次自动刷新的时间戳：上次刷新（手动的也算）+ 间隔；关掉了返回 None"""
+        if self.auto_minutes <= 0:
+            return None
+        try:
+            last = datetime.fromisoformat(self.last_refresh).timestamp() if self.last_refresh else 0
+        except ValueError:
+            last = 0
+        return max(last + self.auto_minutes * 60, time.time() if not last else 0)
+
+    def auto_refresh_loop(self):
         while True:
-            time.sleep(minutes * 60)
-            self.enqueue_refresh(force=False)
+            due = self.next_auto_refresh()
+            if due is None:
+                self.auto_wake.wait()
+            elif due > time.time():
+                self.auto_wake.wait(min(due - time.time(), 3600))
+            else:
+                self.enqueue_refresh(force=False)
+                # 刷新完成后 last_refresh 会变；完成前不重复排队（enqueue_refresh 自己也会去重）
+                self.auto_wake.wait(60)
+            self.auto_wake.clear()
+
+    def set_auto_refresh(self, minutes):
+        self.auto_minutes = max(int(minutes), 0)
+        tmp = SETTINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"auto_refresh_minutes": self.auto_minutes}, f)
+        os.replace(tmp, SETTINGS_PATH)
+        self.auto_wake.set()
+        with self.lock:
+            self.version += 1
 
     def start(self):
         threading.Thread(target=self.worker, daemon=True).start()
-        minutes = self.config.get("auto_refresh_minutes", 0) or 0
-        if minutes > 0:
-            threading.Thread(target=self.auto_refresh_loop, args=(minutes,), daemon=True).start()
+        threading.Thread(target=self.auto_refresh_loop, daemon=True).start()
         # 默认不自动刷新；但如果一次都没拉过（没有缓存），启动时拉一次
         if self.config.get("refresh_on_start", False) or not self.last_good:
             self.enqueue_refresh(force=True)
@@ -504,7 +620,7 @@ class Backend:
                     "load_private": r.get("load_private", False), "qos": r.get("qos", []),
                     "scheduler": r.get("scheduler", "slurm"), "qos_label": r.get("qos_label", "QoS"),
                     "features": r.get("features", sorted(schedulers.ALL_FEATURES)),
-                    "backlog": r.get("backlog"), "partitions": r.get("partitions"),
+                    "backlog": r.get("backlog"), "overview": r.get("overview"),
                 })
             errors.extend(as_l(e) for e in self.results.get("_errors", {}).values())
             inspect, pending = self.inspect_view(jobs)
@@ -514,10 +630,14 @@ class Backend:
                 "jobs": jobs,
                 "clusters": clusters,
                 "updated_at": self.last_refresh,
+                "auto_refresh": {"minutes": self.auto_minutes,
+                                 "next": (datetime.fromtimestamp(self.next_auto_refresh(), timezone.utc).isoformat()
+                                          if self.auto_minutes > 0 else None)},
                 "errors": errors,
                 "inspect": inspect,
                 "inspect_pending": pending,
                 "alerts": self.alerts(jobs),
+                "model": self.model_status(),
                 "settings": {"dir_size_warn_gb": self.config.get("dir_size_warn_gb", 30),
                              "dir_files_warn": self.config.get("dir_files_warn", 50)},
             }))
@@ -554,6 +674,15 @@ class Backend:
         out = []
         if self.waitlog_full:
             out.append({"type": "waitlog_full", "dir": self.waitlog_dir, **self.waitlog_full})
+        # 0) 排队原因说明永远不会开始（依赖失败、申请超过分区 / QoS 单个 job 的上限、被 hold ……）
+        never = {}
+        for j in jobs:
+            if j.get("never_run") and j.get("live", True):
+                never.setdefault((j["cluster"], j["never_run"]), []).append(j)
+        for (cluster, reason), js in sorted(never.items()):
+            out.append({"type": "never_run", "cluster": cluster, "reason": reason,
+                        "jobs": sorted((j["id"] for j in js), key=sort_jobid),
+                        "stale": any(j.get("stale") for j in js)})
         # 1) 好几个 job 同时在同一个目录里跑（一般是 dependency 没设对）
         #    同一个 array job 的不同 task 共用目录是正常的，不算
         running = {}
@@ -662,7 +791,7 @@ class Backend:
         if not sched.has("qos_info"):
             cached = {"assoc": [], "limits": {}}
         load = sched.parse_load(sections) if with_load else {}
-        part_load = sched.parse_partition_load(sections) if with_load else {}
+        combo_load = sched.parse_combo_load(sections) if with_load else {}
         part_info = sched.parse_partitions(sections) if sched.has("partition_info") else None
         # 有的集群（比如 PrivateData=jobs）只能看到自己的 job，
         # 这时"全集群"数字其实就是你自己的，没有参考价值，标记一下前端显示为隐藏
@@ -670,7 +799,7 @@ class Backend:
         load_total = sum(v["running"] + v["pending"] for v in load.values())
         load_private = with_load and load_total == mine_active
         if load_private:
-            load, part_load, with_load = {}, {}, False
+            load, combo_load, with_load = {}, {}, False
 
         if with_backlog:
             try:
@@ -686,34 +815,105 @@ class Backend:
                 if j["state"] in PENDING and j.get("live"):
                     j["wait_est"] = sched.estimate_job(j, bl_cached["model"])
 
+        qos_table = self.build_qos_table(c, jobs, cached, load, with_load)
+        bl_result = bl_cached["result"] if bl_cached else None
         return {"name": name, "ok": True, "error": None, "warnings": warnings,
                 "load_private": load_private, "scheduler": sched.kind,
                 "features": sorted(sched.features), "qos_label": sched.qos_label,
-                "backlog": bl_cached["result"] if bl_cached else None,
-                "jobs": jobs, "qos": self.build_qos_table(c, jobs, cached, load, with_load),
-                "partitions": self.build_partition_table(jobs, part_info, part_load,
-                                                         with_load and sched.PARTITION_LOAD)}
+                "backlog": bl_result, "jobs": jobs, "qos": qos_table,
+                "overview": self.build_overview(c, jobs, qos_table, part_info, combo_load,
+                                                with_load and sched.PARTITION_LOAD,
+                                                cached["limits"], bl_result)}
 
     @staticmethod
-    def build_partition_table(jobs, info, load, with_load):
-        """分区表：sinfo 里的分区（按 sinfo 的顺序）+ 你的 job 用到、但 sinfo 里没有的分区。
-        info=None 表示拿不到 sinfo（不支持 / 没权限），这时只有"我的"那一列"""
-        mine = {}
+    def build_overview(c, jobs, qos_table, part_info, combo, with_combo, limits, bl):
+        """QoS → 分区 的树：QoS 面板、分区表、排队积压合成一张。
+
+        Slurm 里 QoS 和分区是两回事：分区 = 一批节点（在哪跑），QoS = 规则（限额、优先级、
+        最长时间）。每个 job 选一个 QoS + 一个（或几个）分区，是多对多的。一个 QoS 下面挂哪些分区：
+          1. config.yaml 里这个集群写了 qos_partitions 就按写的
+          2. 分区的 AllowQos / DenyQos 写明了 → 按规则（比如 young：cpu 只允许 freecpu,test,nolimit）
+          3. AllowQos=ALL（或者不知道）→ 看实际见过的组合：全集群的 squeue + 你自己的 job
+             （包括已经结束的）；你只有一个 QoS 时（比如 sulis 的 normal），所有分区都挂在它下面
+        没挂到任何一个 QoS 下面的分区放进"其他分区"。
+        分区自己也可以有 QoS（sulis 的 part_compute 等），它的限额对这个分区里所有 job 生效。"""
+        def parts_of(j):
+            return [p for p in (j.get("partition") or "").split(",") if p]
+
+        seen = set(combo)  # 见过的 (QoS, 分区)
+        mine = {}  # (QoS, 分区) -> 我的 运行/排队
         for j in jobs.values():
-            if j["state"] not in ACTIVE | PENDING:
-                continue
-            for p in [p for p in (j.get("partition") or "").split(",") if p] or ["-"]:
-                m = mine.setdefault(p, {"running": 0, "pending": 0})
-                m["running" if j["state"] in ACTIVE else "pending"] += 1
-        rows = [dict(r) for r in info or []]
-        seen = {r["name"] for r in rows}
-        rows += [{"name": p} for p in sorted(mine) if p not in seen]
-        for r in rows:
-            m, a = mine.get(r["name"], {}), load.get(r["name"], {})
-            r.update({"mine_running": m.get("running", 0), "mine_pending": m.get("pending", 0),
-                      "all_running": a.get("running", 0) if with_load else None,
-                      "all_pending": a.get("pending", 0) if with_load else None})
-        return {"info": info is not None, "rows": rows}
+            q = j.get("qos") or ""
+            for p in parts_of(j):
+                seen.add((q, p))
+                if j["state"] in ACTIVE | PENDING:
+                    # pending 里包括等依赖的（dep）：前端把它们从"排队"里拿出来，放在运行数后面的括号里
+                    m = mine.setdefault((q, p), {"running": 0, "pending": 0, "dep": 0})
+                    m["running" if j["state"] in ACTIVE else "pending"] += 1
+                    m["dep"] += j["state"] in PENDING and waiting_on_dependency(j)
+
+        parts = {r["name"]: dict(r) for r in part_info or []}
+        for _, p in sorted(seen):  # 只在 job 里见过的分区（比如 SGE 的并行环境）
+            parts.setdefault(p, {"name": p, "allow_qos": None, "deny_qos": [], "part_qos": ""})
+        bl_parts = {x["name"]: x for x in bl.get("partitions", [])} if bl and bl.get("ok") else {}
+        for p, info in parts.items():
+            tot_m = [v for (_, pp), v in mine.items() if pp == p]
+            tot_a = [v for (_, pp), v in combo.items() if pp == p]
+            info.update({
+                "mine_running": sum(v["running"] for v in tot_m),
+                "mine_pending": sum(v["pending"] for v in tot_m),
+                "mine_dep": sum(v["dep"] for v in tot_m),
+                "all_running": sum(v["running"] for v in tot_a) if with_combo else None,
+                "all_pending": sum(v["pending"] for v in tot_a) if with_combo else None,
+                "part_qos_limits": limits.get(info.get("part_qos")) if info.get("part_qos") else None,
+            })
+            b = bl_parts.get(p)
+            if b:
+                info["backlog"] = {"cpu_min": b["cpu_min"], "cpu_max": b["cpu_max"], "gpu": b["gpu"]}
+
+        override = {str(k): [str(x) for x in (v or [])] for k, v in (c.get("qos_partitions") or {}).items()}
+        user_qos = [r["name"] for r in qos_table]
+
+        def attached(q, p):
+            if q in override:
+                return p in override[q]
+            info = parts[p]
+            if q in (info.get("deny_qos") or []):
+                return False
+            if info.get("allow_qos") is not None:
+                return q in info["allow_qos"]
+            return (q, p) in seen or len(user_qos) == 1
+
+        groups, used = [], set()
+        for row in qos_table:
+            q = row["name"]
+            children = []
+            for p in parts:
+                if not attached(q, p):
+                    continue
+                used.add(p)
+                m, a = mine.get((q, p), {}), combo.get((q, p), {})
+                children.append({"name": p, "mine_running": m.get("running", 0),
+                                 "mine_pending": m.get("pending", 0), "mine_dep": m.get("dep", 0),
+                                 "all_running": a.get("running", 0) if with_combo else None,
+                                 "all_pending": a.get("pending", 0) if with_combo else None})
+            groups.append({"qos": row["name"], "children": children})
+
+        # 收进"其他分区"的：config 里 hide_partitions 写了的（支持通配符），和现在一个 job 都没有的
+        # （看得到全集群就按全集群，看不到就按你自己的）。树里不显示，但"交到哪里"的建议
+        # 仍然会考虑没有 job 的分区（空分区可能正好最快），config 隐藏的不考虑
+        hide = [str(x) for x in (c.get("hide_partitions") or [])]
+        for p, info in parts.items():
+            n = (info["all_running"] or 0) + (info["all_pending"] or 0) if with_combo else \
+                info["mine_running"] + info["mine_pending"]
+            info["hidden"] = "config" if any(fnmatch.fnmatchcase(p, pat) for pat in hide) \
+                else "empty" if n == 0 else ""
+        for g in groups:
+            for ch in g["children"]:
+                ch["hidden"] = parts[ch["name"]]["hidden"]
+        other = [p for p in parts if p not in used or parts[p]["hidden"]]
+        return {"groups": groups, "other": other, "partitions": parts,
+                "part_info": part_info is not None}
 
     @staticmethod
     def build_qos_table(c, jobs, cached, load, with_load):
@@ -740,6 +940,8 @@ class Backend:
                 "configured": q in configured_names,
                 "mine_running": sum(1 for j in mine if j["state"] in ACTIVE),
                 "mine_pending": sum(1 for j in mine if j["state"] in PENDING),
+                # 其中在等依赖的（不算真正在排队；mine_pending 仍然包括它们，waitlog / 模型用的是这个）
+                "mine_dep": sum(1 for j in mine if j["state"] in PENDING and waiting_on_dependency(j)),
                 "all_running": load.get(q, {}).get("running", 0) if with_load else None,
                 "all_pending": load.get(q, {}).get("pending", 0) if with_load else None,
                 "max_jobs_pu": lim.get("max_jobs_pu", ""),
@@ -753,6 +955,36 @@ class Backend:
 app = Flask(__name__)
 config = load_config()
 backend = Backend(config)
+
+
+def parse_allow_from(items):
+    """config.yaml 的 allow_from：IP 或网段列表；不写 = 谁都能看"""
+    nets = []
+    for item in items or []:
+        try:
+            nets.append(ipaddress.ip_network(str(item).strip(), strict=False))
+        except ValueError:
+            print(f"allow_from: ignoring invalid entry {item!r}")
+    return nets
+
+
+ALLOW_FROM = parse_allow_from(config.get("allow_from"))
+
+
+@app.before_request
+def check_client_ip():
+    """监听 0.0.0.0 时只让 allow_from 里的地址看（页面和接口都一样）"""
+    if not ALLOW_FROM:
+        return None
+    try:
+        ip = ipaddress.ip_address(request.remote_addr or "")
+    except ValueError:
+        abort(403)
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if not any(ip in net for net in ALLOW_FROM):
+        abort(403)
+    return None
 
 
 @app.route("/")
@@ -778,6 +1010,20 @@ def api_refresh():
     return jsonify({"ok": True, "queued": queued})
 
 
+@app.route("/api/settings", methods=["POST"])
+def api_settings():
+    """网页上改设置。body: {"auto_refresh_minutes": 0 / 360 / 720 / 1440 ...}"""
+    body = request.get_json(silent=True) or {}
+    try:
+        minutes = int(body["auto_refresh_minutes"])
+        if not 0 <= minutes <= 7 * 24 * 60:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"ok": False})
+    backend.set_auto_refresh(minutes)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/history")
 def api_history():
     """排队历史（从 waitlog/jobs.csv）：?days=30&cluster=&qos=&q="""
@@ -796,6 +1042,29 @@ def api_history():
               "n_backups": len(backups),
               "backup_days": backend.config.get("waitlog_backup_days", 7)})
     return jsonify(h)
+
+
+@app.route("/api/model")
+def api_model():
+    return jsonify(backend.model_status())
+
+
+@app.route("/api/model/train", methods=["POST"])
+def api_model_train():
+    """用 waitlog 重新训练等待预测模型（后台线程，几秒）"""
+    if not backend.predictor or not backend.predictor.available:
+        return jsonify({"ok": False})
+    return jsonify({"ok": True, "started": backend.train_model()})
+
+
+@app.route("/api/model/suggest", methods=["POST"])
+def api_model_suggest():
+    """新 job 交到哪里最快。body: {cpus, gpus, gpu_type, nodes, time_h, cluster}"""
+    body = request.get_json(silent=True) or {}
+    try:
+        return jsonify({"ok": True, "items": backend.suggest(body)})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": as_l(L(f"预测出错: {e}", f"Prediction failed: {e}"))})
 
 
 @app.route("/api/inspect", methods=["POST"])

@@ -7,7 +7,8 @@
   请求的资源、第一次看到它在排队时的集群状态（"当时的 cluster 状态"）、
   最终的开始时间和等待时间。没开始就结束/还在排的标 censored=1。
 - qos_snapshots.csv：每次刷新追加：每个 QoS 全集群/我的 运行/排队数。
-- partition_snapshots.csv：积压数据更新时追加：每个分区（× GPU 型号）的积压范围。
+- partition_snapshots.csv：每次刷新追加：每个分区全集群的 运行/排队数、我的 运行/排队数，
+  有积压数据的再加积压范围（× GPU 型号）。
 
 快照表可以按时间和 jobs.csv 里的 eligible/submit 时间对上，拿到更精确的"提交时的状态"。
 时间都是集群自己的本地时间字符串（YYYY-MM-DDTHH:MM:SS）；observed_at 是本机时间。
@@ -44,11 +45,15 @@ JOB_COLUMNS = [
     "obs_qos_all_running", "obs_qos_all_pending", "obs_qos_mine_running", "obs_qos_mine_pending",
     "obs_bl_partition", "obs_bl_cpu_min_h", "obs_bl_cpu_max_h", "obs_bl_gpu_min_h",
     "obs_bl_gpu_max_h", "obs_bl_bottleneck", "obs_bl_age_min",
+    # 当时这个分区全集群的运行 / 排队数（所有 QoS）；当时预测模型给的排队时间（以后用来检验模型）
+    "obs_part_all_running", "obs_part_all_pending", "obs_ml_q20_h", "obs_ml_q50_h", "obs_ml_q80_h",
 ]
 QOS_COLUMNS = ["observed_at", "cluster", "qos", "all_running", "all_pending",
                "mine_running", "mine_pending", "max_jobs_pu", "max_submit_pu", "max_wall"]
 PART_COLUMNS = ["backlog_at", "cluster", "partition", "cpus", "gpus", "cpu_min_h", "cpu_max_h",
-                "gpu_type", "gpu_min_h", "gpu_max_h", "mine_running", "mine_pending"]
+                "gpu_type", "gpu_min_h", "gpu_max_h", "mine_running", "mine_pending",
+                # 后来加的：每次刷新都写（本机时间），全集群在这个分区的运行 / 排队数（看不到就空）
+                "observed_at", "all_running", "all_pending"]
 
 
 def parse_ts(s):
@@ -99,7 +104,6 @@ class WaitLog:
         self.part_path = os.path.join(directory, "partition_snapshots.csv")
         self.rows = {}  # (cluster, jobid) -> row dict
         self.lock = threading.Lock()  # update() 在后台线程跑，history() 在网页请求里读
-        self.last_backlog_at = {}  # cluster -> 上次写过的积压数据时间，避免重复写
         os.makedirs(directory, exist_ok=True)
         self._load()
 
@@ -110,12 +114,6 @@ class WaitLog:
                     self.rows[(row.get("cluster", ""), row.get("jobid", ""))] = row
         except OSError:
             pass
-        try:
-            with open(self.part_path, newline="", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    self.last_backlog_at[row.get("cluster", "")] = row.get("backlog_at", "")
-        except OSError:
-            pass
 
     # ---------------- 写文件 ----------------
     def _append(self, path, columns, rows):
@@ -124,7 +122,17 @@ class WaitLog:
         if os.path.exists(path):
             with open(path, newline="", encoding="utf-8") as f:
                 header = next(csv.reader(f), None)
-            if header != columns:  # 列变了：旧文件改名保留，新开一个
+            if header and header != columns and set(header) <= set(columns):
+                # 只是加了列：把旧数据搬到新表头下（新列留空）
+                with open(path, newline="", encoding="utf-8") as f:
+                    old = list(csv.DictReader(f))
+                tmp = path + ".tmp"
+                with open(tmp, "w", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+                    w.writeheader()
+                    w.writerows(old)
+                os.replace(tmp, path)
+            elif header != columns:  # 列变了：旧文件改名保留，新开一个
                 os.replace(path, f"{path}.{datetime.now():%Y%m%d%H%M%S}.old")
         new = not os.path.exists(path)
         with open(path, "a", newline="", encoding="utf-8") as f:
@@ -156,6 +164,7 @@ class WaitLog:
         except ValueError:
             bl_at = None
         load_private = result.get("load_private")
+        ov_parts = (result.get("overview") or {}).get("partitions", {})
         with self.lock:
             for jid, j in result.get("jobs", {}).items():
                 if "[" in jid:  # 还没展开的 array 排队记录（123_[1-10]），等各个 task 出现再记
@@ -167,10 +176,14 @@ class WaitLog:
                     self.rows[key] = row
                 self._fill_static(row, j)
                 row["last_seen_at"] = now_s
-                if j["state"] in PENDING and row.get("seen_pending") != "1" and is_live(j):
+                # 记"第一次看到它排队时"的状态；那时还在等 dependency 的，等它真正开始排队后再记一次
+                # （等依赖时的集群状态和它什么时候开始没关系）
+                if j["state"] in PENDING and is_live(j) and (
+                        row.get("seen_pending") != "1"
+                        or (waiting_dep(row.get("obs_reason")) and not waiting_dep(j.get("reason")))):
                     row["seen_pending"] = "1"
                     self._fill_obs(row, j, now, qos_rows.get(j.get("qos")), bl_parts, bl_at,
-                                   load_private)
+                                   load_private, ov_parts)
                 self._fill_outcome(row, j, now_s)
             self._write_jobs()
         self._append(self.qos_path, QOS_COLUMNS, [{
@@ -181,19 +194,25 @@ class WaitLog:
             "max_jobs_pu": q.get("max_jobs_pu", ""), "max_submit_pu": q.get("max_submit_pu", ""),
             "max_wall": q.get("max_wall", ""),
         } for q in result.get("qos", [])])
-        if bl_parts and bl.get("fetched_at") != self.last_backlog_at.get(cluster):
-            self.last_backlog_at[cluster] = bl.get("fetched_at")
-            rows = []
-            for p in bl_parts.values():
-                base = {"backlog_at": bl.get("fetched_at"), "cluster": cluster,
-                        "partition": p["name"], "cpus": p["cpus"], "gpus": p["gpus"],
-                        "cpu_min_h": fmt(p["cpu_min"]), "cpu_max_h": fmt(p["cpu_max"]),
-                        "mine_running": p["mine_running"], "mine_pending": p["mine_pending"]}
-                rows.append({**base, "gpu_type": ""})
-                for g in p["gpu"]:
-                    rows.append({**base, "gpu_type": g["type"], "gpu_min_h": fmt(g["min"]),
-                                 "gpu_max_h": fmt(g["max"])})
-            self._append(self.part_path, PART_COLUMNS, rows)
+        # 分区快照：每次刷新每个分区一行（全集群 / 我的 运行排队数）；有积压数据的带上积压范围，
+        # GPU 分区再每种卡一行
+        rows = []
+        for name in dict.fromkeys(list(ov_parts) + list(bl_parts)):
+            o, p = ov_parts.get(name, {}), bl_parts.get(name)
+            base = {"observed_at": now_s, "cluster": cluster, "partition": name, "gpu_type": "",
+                    "all_running": "" if o.get("all_running") is None else o["all_running"],
+                    "all_pending": "" if o.get("all_pending") is None else o["all_pending"],
+                    "mine_running": o.get("mine_running", p["mine_running"] if p else ""),
+                    "mine_pending": o.get("mine_pending", p["mine_pending"] if p else ""),
+                    "cpus": ((o.get("cpus") or {}).get("total") or "") if not p else p["cpus"]}
+            if p:
+                base.update({"backlog_at": bl.get("fetched_at"), "gpus": p["gpus"],
+                             "cpu_min_h": fmt(p["cpu_min"]), "cpu_max_h": fmt(p["cpu_max"])})
+            rows.append(base)
+            for g in (p or {}).get("gpu", []):
+                rows.append({**base, "gpu_type": g["type"], "gpu_min_h": fmt(g["min"]),
+                             "gpu_max_h": fmt(g["max"])})
+        self._append(self.part_path, PART_COLUMNS, rows)
 
     @staticmethod
     def _fill_static(row, j):
@@ -219,9 +238,13 @@ class WaitLog:
             row["gpus"] = "0"
 
     @staticmethod
-    def _fill_obs(row, j, now, q, bl_parts, bl_at, load_private):
+    def _fill_obs(row, j, now, q, bl_parts, bl_at, load_private, ov_parts):
         est = j.get("wait_est") or {}
-        part = bl_parts.get(est.get("partition") or (j.get("partition") or "").split(",")[0], {})
+        ml = (j.get("ml_est") or {}).get("wait") or ["", "", ""]
+        pname = est.get("partition") or (j.get("ml_est") or {}).get("partition") \
+            or (j.get("partition") or "").split(",")[0]
+        part = bl_parts.get(pname, {})
+        ov = ov_parts.get(pname, {})
         gpu = next((g for g in part.get("gpu", [])
                     if est and g["type"] in est.get("bottleneck", {}).get("label", "")), None)
         ref = j.get("eligible") or j.get("submit")
@@ -244,6 +267,9 @@ class WaitLog:
             "obs_bl_bottleneck": est.get("bottleneck", {}).get("label", ""),
             "obs_bl_age_min": round((datetime.now(timezone.utc) - bl_at).total_seconds() / 60, 1)
                               if bl_at and part else "",
+            "obs_part_all_running": "" if ov.get("all_running") is None else ov["all_running"],
+            "obs_part_all_pending": "" if ov.get("all_pending") is None else ov["all_pending"],
+            "obs_ml_q20_h": fmt(ml[0]), "obs_ml_q50_h": fmt(ml[1]), "obs_ml_q80_h": fmt(ml[2]),
         })
 
     @staticmethod
@@ -330,6 +356,11 @@ class WaitLog:
             "censored": r.get("censored") != "0",
         } for r in jobs[:limit]]
         return {"stats": stats, "jobs": out, "total": len(jobs)}
+
+
+def waiting_dep(reason):
+    """squeue 的 Dependency / SGE 的 'Dependency (hqw)'"""
+    return (reason or "").strip("()").startswith("Dependency")
 
 
 def is_live(j):

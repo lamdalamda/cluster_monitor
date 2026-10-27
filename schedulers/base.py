@@ -18,7 +18,7 @@ Backend（app.py）只管 SSH、缓存、合并结果、给前端的数据；每
 - qos_info      能用哪些 QoS 和它们的限额（sacctmgr）
 - backlog       排队积压估计（backlog.py，要看到全集群的 job 和分区）
 - est_start     调度器自己估计的开始时间
-- partition_info 每个分区的节点 / CPU 用量和时限（sinfo）
+- partition_info 每个分区的节点 / CPU 用量、时限、允许哪些 QoS（sinfo / scontrol）
 """
 
 import re
@@ -33,7 +33,7 @@ ALL_FEATURES = {"history", "cluster_load", "qos_info", "backlog", "est_start", "
 class Scheduler(ABC):
     kind = ""            # config.yaml 里 scheduler: 的值
     qos_label = "QoS"    # 前端 QoS 面板的列名
-    PARTITION_LOAD = False  # parse_partition_load 能给出全集群按分区的数字
+    PARTITION_LOAD = False  # parse_combo_load 能给出全集群按 QoS × 分区的数字
     FEATURES = frozenset()
 
     def __init__(self, cluster, config):
@@ -79,13 +79,16 @@ class Scheduler(ABC):
         """{qos: {"running": n, "pending": n}}"""
         return {}
 
-    def parse_partition_load(self, sections):
-        """{分区: {"running": n, "pending": n}}（排队中的 job 可以同时排在好几个分区，每个都算）"""
+    def parse_combo_load(self, sections):
+        """全集群按 QoS × 分区：{(qos, 分区): {"running": n, "pending": n}}
+        （排队中的 job 可以同时排在好几个分区，每个都算）"""
         return {}
 
     def parse_partitions(self, sections):
-        """[{"name", "default", "avail", "time_limit", "nodes": {alloc, idle, other, total},
-            "cpus": {alloc, idle, other, total}}]；拿不到返回 None"""
+        """[{"name", "default", "avail", "time_limit",
+             "nodes": {alloc, idle, other, total} 或只有 {total}, "cpus": 同上,
+             "allow_qos": [允许的 QoS] 或 None（ALL / 不知道）, "deny_qos": [...],
+             "part_qos": 分区自己的 QoS（限额对这个分区里所有 job 生效）}]；拿不到返回 None"""
         return None
 
     def optional_sections(self):
@@ -131,6 +134,13 @@ def parse_lines(lines, fields, sep="|"):
         if len(parts) == len(fields):
             out.append(dict(zip(fields, parts)))
     return out
+
+
+def waiting_on_dependency(j):
+    """排队中、但还在等前置 job（Slurm 的 Dependency / SGE 的 'Dependency (hqw)'）：
+    前置 job 结束之前排到队头也不会开始，不算真正在排队"""
+    return (j.get("reason") or "").strip("()").startswith("Dependency") or any(
+        d.get("status") == "unfulfilled" for d in j.get("deps", []))
 
 
 def sort_jobid(jid):

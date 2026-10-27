@@ -29,6 +29,15 @@
 #   backlog（排队积压）、est_start（预计开始时间）、partition_info（分区表里的节点 / CPU，sinfo）
 #
 # inspect_files（可选）：这个集群单独用的输出文件模式，覆盖下面全局的 inspect_files。
+#
+# qos_partitions（可选）：手动指定每个 QoS 能用哪些分区（页面上 QoS → 分区 的树）。
+#   不写的话按分区的 AllowQos 规则，AllowQos=ALL 时按实际见过的组合。例如：
+#   qos_partitions:
+#     bbgpu: [icelake-gpua100-shared, icelake-gpua100_80-shared]
+#
+# hide_partitions（可选）：QoS → 分区 的树里总是收进"其他分区"的分区（支持通配符 * ?），
+#   "交到哪里"的建议也不考虑它们。现在一个 job 都没有的分区本来就会自动收起来。例如：
+#   hide_partitions: [gpu-devel, "*-test"]
 
 #
 # qos（可选）：想在 QoS 面板里看哪些 QoS。不写的话会自动用
@@ -61,7 +70,8 @@ clusters:
 # 刷新方式：默认不自动刷新，网页上点"立即刷新"才去 SSH 拉数据。
 # 网页和 SSH 是解耦的：打开网页立刻显示上一次的数据（存在 .dashboard_cache.json），
 # 刷新 / 读目录都在后台按顺序一个个执行，网页上方有进度条。
-# auto_refresh_minutes：>0 就每隔这么多分钟自动刷新一次；0 = 不自动刷新
+# auto_refresh_minutes：>0 就每隔这么多分钟自动刷新一次（从上一次刷新算起，手动的也算）；0 = 不自动刷新。
+# 网页右上角的下拉框可以改（6 / 12 / 24 小时 / 关闭），改了存在 .dashboard_settings.json，比这里优先
 auto_refresh_minutes: 0
 # 启动 app.py 时要不要先刷新一次（没有缓存的时候总会刷新一次）
 refresh_on_start: false
@@ -121,6 +131,37 @@ waitlog_backup_days: 7
 waitlog_backup_keep: 10
 waitlog_backup_dir: waitlog_backups
 
+# 排队等待预测（predictor.py，需要 scikit-learn）：用 waitlog 训练的小模型，
+# 网页上"排队预测"里点"训练 / 更新模型"才会训练（几秒），存到 wait_model_path；
+# 之后每次刷新给排队中的 job 预测开始时间，也可以问"新 job 交到哪里最快"。
+# 半衰期：越旧的数据权重越小（集群忙闲会变）。想让模型更准，把 auto_refresh_minutes
+# 设成 15 左右，集群状态的快照会密很多。
+wait_model: true
+wait_model_path: models/wait_model.pkl
+wait_model_half_life_days: 14
+
+# 排队原因匹配下面任意一个（通配符 * ?）就认为这个 job 永远不会开始（要改提交脚本 / 找管理员），
+# 页面顶上告警，也不给它预测开始时间。原因码见 https://slurm.schedmd.com/job_reason_codes.html
+# 注意别把"暂时的"放进来：Priority / Resources / Dependency / QOSMaxJobsPerUserLimit / AssocGrp* 会自己好
+never_run_reasons:
+  - DependencyNeverSatisfied   # 依赖永远满足不了（比如 afterok 的前置 job 失败了）
+  - BadConstraints             # --constraint 之类的要求没有节点能满足
+  - PartitionTimeLimit         # 申请的时长超过分区上限
+  - PartitionNodeLimit         # 节点数不在分区允许的范围
+  - "QOSMax*PerJob*"           # 单个 job 申请的 CPU / GPU / 内存 / 时长超过 QoS 上限
+  - "AssocMax*PerJob*"         # 同上，账户的上限
+  - InvalidAccount
+  - InvalidQOS
+  - AccountNotAllowed
+  - QOSNotAllowed              # 这个 QoS 不能用在这个分区 / 账户
+  - JobHeldUser                # 被 hold 了（scontrol hold / release）
+  - JobHeldAdmin
+  - JobHoldMaxRequeue          # requeue 次数到顶
+  - DeadLine
+  - ReservationDeleted
+  - "Error (*"                 # SGE：Eqw（出错，qstat -j 看 error reason，qmod -cj 清除）
+  - "Hold (*"                  # SGE：hqw 但没有依赖（被 hold 了）
+
 # SSH 单次命令超时（秒）
 ssh_timeout_seconds: 15
 
@@ -129,3 +170,6 @@ ssh_timeout_seconds: 15
 # 想在同一局域网内用手机/其他机器打开：改成 0.0.0.0（注意：job名字等信息就暴露在局域网了）
 host: 127.0.0.1
 port: 8787
+# 只允许这些地址（IP 或网段）打开页面，其他地址返回 403。不写 = 不限制。
+# host 设成 0.0.0.0 时建议写上，比如只让本机和 ZeroTier 网段看：
+#   allow_from: [127.0.0.1, "::1", 192.168.192.0/24]

@@ -2,6 +2,52 @@
 
 [English](#english) · [中文](#中文)
 
+> **For the impatient, by the impatient.**
+>
+> Your jobs are already the most patient patients in the world: they sit in the queue's
+> waiting room for days without complaining. You, on the other hand, have run `squeue` 37
+> times since lunch, on four clusters, in four terminals, and one of them wants a 2FA code.
+>
+> This repo is the triage board. One page shows every job on every cluster: what's running,
+> what's waiting and why, which partition is quiet, which job will *never* start (sorry, the
+> dependency it was waiting for died), and a small model guessing when the rest will start
+> and where your next job would start soonest. Then you can close the terminals and go be
+> impatient about something else.
+>
+> No admin rights, no agents on the cluster, no web API: just your existing `ssh` keys.
+> Setup takes about as long as the wait for one `squeue`.
+
+> **你看，你又急。**
+>
+> 交完 job 才三分钟，你已经 `squeue` 了八遍；一个集群不够，四个集群轮流 ssh，其中一个还要
+> 先输 2FA；排了一晚上没动，第二天才发现是依赖的 job 早就挂了……
+>
+> 我觉得你有点急了。
+>
+> 这个 repo 就是给急的人准备的：一个网页把所有集群上的 job 摆在一起——哪些在跑、哪些在排、
+> 为什么在排、哪个分区比较空、哪个 job **永远不会开始**（赶紧删了重交），再用一个小模型猜猜
+> 剩下的什么时候开始、下一个 job 往哪交最快。看完就可以把终端关了，安心地去急别的事。
+>
+> 不用管理员权限，不用在集群上装任何东西，不走 web API，用的就是你现有的 `ssh` key。
+> 装好它花的时间，比你等一次 `squeue` 还短。
+
+### TL;DR
+
+```bash
+git clone https://github.com/lamdalamda/cluster_monitor.git
+cd cluster_monitor
+python3 install.py   # 回答几个问题，一路回车也行 / answer a few questions (Enter = default)
+python3 app.py       # 或者让 install.py 装成 systemd 服务 / or let install.py set up a systemd service
+```
+
+然后打开 / then open <http://127.0.0.1:8787>，点"立即刷新" / click "Refresh"。
+想要排队预测：在跑 dashboard 的 Python 里 `pip install scikit-learn`，再到页面上点"训练 / 更新模型"。
+For wait prediction: `pip install scikit-learn` in the Python that runs the dashboard, then
+click "Train / update model" on the page.
+
+前提 / Prerequisite: `ssh <集群 cluster>` 不用输密码就能登录（ssh key + `~/.ssh/config`）。
+Slurm 和 SGE 都支持。
+
 ## English
 
 A small web page you run on your own workstation to see, as tables, your jobs on several
@@ -78,6 +124,30 @@ file: per cluster × QoS, how many jobs started and their median / P25–P75 / P
   (default 10) are kept. Automatic refreshes never make a backup, and no new backup is made
   if nothing changed since the last one.
 
+### Wait prediction (predictor.py)
+
+The "Wait prediction" section (collapsed by default, under the QoS tree) trains a small
+model on the waitlog data when you click **Train / update model** (a few seconds; needs
+scikit-learn, saved to `models/wait_model.pkl` and loaded on start). After that:
+
+- every pending job gets a purple **model** start estimate in the Jobs time column (hover
+  for the q20–q80 range). Jobs still waiting on dependencies: start = predecessors' end
+  (start + time limit, so conservative) + the predicted queue wait;
+- "Where to submit": enter cores / GPUs / nodes / hours, and every QoS + partition that
+  fits is ranked by predicted wait, using the latest refresh's queue state.
+
+Model: scikit-learn HistGradientBoosting with quantile loss (q20 / q50 / q80), one per
+cluster (global fallback for clusters with little data); QoS / partition are features.
+Inputs: requested resources and the queue state when the job became eligible (QoS and
+partition running / pending, backlog estimate, Slurm's estimate and reason, time already
+waited, whether / how long it waited on dependencies). Waits are always counted from
+eligible. Jobs submitted together count as one sample; older data is down-weighted
+(`wait_model_half_life_days`). Each training run backtests over time against "historical
+quantiles" and uses those instead on clusters where they did better; the backtest table is
+shown in the page. Predictions with under 3 batches of history are greyed out ("little
+data"). Refreshing more often (`auto_refresh_minutes: 15`) gives the model much better data.
+`python predictor.py` trains and prints the backtest without saving.
+
 ### Run as a systemd service (start on boot)
 
 `python3 install.py` offers this as its last step (it runs the `sudo` commands and asks for
@@ -91,27 +161,32 @@ config.yaml: `sudo systemctl restart hpc-dashboard`. Stop any manually started
 
 ### The page
 
-**QoS panel** (one card per cluster)
-- Mine = your running / pending jobs in this QoS
-- Cluster = running / pending jobs of all users in this QoS; a long queue means it's busy.
-  Some clusters (e.g. with PrivateData) only show your own jobs in squeue; this column
-  then says "hidden"
-- MaxJobs / MaxSubmit / MaxWall / MaxTRES/user = per-user limits from sacctmgr; reaching
-  the running or submit cap is flagged as "run cap" / "submit cap"
-- Click a row to filter the job table to that QoS, click again to clear
-- The QoS list is discovered automatically (sacctmgr assoc); you can also list them under
-  each cluster in config.yaml (`qos:`), with optional notes
-
-**Queue backlog** (one card per cluster)
-- Per partition: cores, GPUs, CPU backlog, GPU backlog per GPU type. Backlog = sum of
-  (remaining time × cores/GPUs) over all jobs ÷ total cores/GPUs, i.e. "how long to clear
-  the current work if it packed perfectly"
-- Range Local – Global: the first only counts this partition, the second includes
-  partitions sharing the same nodes
-- GPU pools: how many cards of each type, shared by which partitions
-- Line cutters: other users' jobs submitted after your earliest pending job in the same
-  partition but already running (usually via backfill)
-- Clusters that hide other users' jobs (bluebear) can't be estimated; a one-line note says so
+**QoS / partitions / backlog** (one card per cluster, a tree: QoS → the partitions it can use)
+- In Slurm a **partition** is a set of nodes (where a job runs) and a **QoS** is a set of
+  rules (per-user caps, max wall time, priority). A job picks one QoS and one or more
+  partitions, so they are many-to-many, not nested. Each QoS row lists the partitions it
+  can use: from the partition's `AllowQos` / `DenyQos` (`scontrol show partition`); with
+  `AllowQos=ALL`, from combinations actually seen (all users' jobs + your own, including
+  finished ones), or every partition if you only have one QoS. Partitions under no QoS go
+  to "Other partitions" (collapsed). Override per cluster with
+  `qos_partitions: {bbgpu: [icelake-gpua100-shared]}`
+- QoS row: Mine / Cluster = running / pending in this QoS (Cluster says "hidden" on
+  clusters that only show your own jobs), MaxWall, and the sacctmgr limits (MaxJobs /
+  MaxSubmit / MaxTRES per user); reaching the running / submit cap is flagged
+- Partition row (click ▶ on the QoS): Mine / Cluster for this QoS in this partition, nodes
+  and CPUs allocated / idle / total (`sinfo`; only totals from `scontrol` where sinfo is
+  forbidden), CPU / GPU backlog, time limit, and the partition's own QoS with its limits
+  (e.g. sulis' `part_compute`), which apply to every job in it
+- Backlog = sum of (remaining time × cores/GPUs) over all jobs ÷ total cores/GPUs, i.e.
+  "how long to clear the current work if it packed perfectly"; range Local – Global (this
+  partition only – including partitions sharing the same nodes). Under the table: GPU pools
+  and "line cutters" (other users' jobs submitted after your earliest pending job in the
+  same partition but already running, usually via backfill). Clusters that hide other
+  users' jobs (bluebear) can't be estimated; the footer says so
+- Click a QoS row to filter the job table to that QoS, a partition row to filter by
+  partition (click the chip next to "Jobs" to clear). A pending job listing several
+  partitions is counted in each. The QoS list is discovered automatically (sacctmgr assoc);
+  you can also list them under each cluster in config.yaml (`qos:`), with optional notes
 
 **Job table**
 - Jobs with the **same name** on a cluster (usually one dependency chain, or repeated
@@ -156,12 +231,6 @@ config.yaml: `sudo systemctl restart hpc-dashboard`. Stop any manually started
     `loop_warn_extra_seconds`, `loop_warn_real_seconds`
   - click a job id to jump to it, click a path to copy it
 
-- **Partitions** (between QoS and backlog): per partition your running / pending, all users'
-  running / pending, nodes and CPUs allocated / idle / total (`sinfo -o '%P|%a|%l|%F|%C'`) and
-  the time limit; click a row to filter the jobs (click the chip next to "Jobs" to clear).
-  A pending job that lists several partitions is counted in each. Clusters that forbid
-  `sinfo` (bluebear) only show your own column
-
 ### Schedulers (Slurm / SGE)
 
 Each cluster in `config.yaml` can set `scheduler: slurm` (default) or `scheduler: sge`.
@@ -177,7 +246,7 @@ Every scheduler is a subclass of `schedulers/base.py:Scheduler` (`schedulers/slu
 | QoS list & limits (`qos_info`) | sacctmgr | — (QoS panel groups by project, no limit columns) |
 | backlog estimate (`backlog`) | squeue + sinfo | — |
 | scheduler's estimated start (`est_start`) | squeue | — |
-| partition nodes / CPUs (`partition_info`) | sinfo | — (partition table groups your jobs by PE) |
+| partition nodes / CPUs, AllowQos (`partition_info`) | sinfo + scontrol | — (partition table groups your jobs by PE) |
 
 Turn features off per cluster with `disable: [cluster_load, backlog]`, e.g. for a cluster
 that hides other users' jobs (this is also auto-detected: if the cluster-wide counts equal
@@ -188,13 +257,23 @@ registering it in `schedulers/__init__.py`.
 ### Common tweaks
 
 - **Only some clusters**: set `enabled: false` (or delete) the others in `config.yaml`.
-- **Automatic refresh**: `auto_refresh_minutes: 5` (SSH has a cost, don't go too low).
+- **Automatic refresh**: the dropdown next to "Refresh" (off / 6 / 12 / 24 h, counted from
+  the last refresh, manual ones included; saved in `.dashboard_settings.json`, which wins over
+  `auto_refresh_minutes` in config.yaml).
+- **Hide partitions**: partitions with no jobs are folded into "Other partitions"
+  automatically; list more per cluster in `hide_partitions` (wildcards ok).
+- **"Won't start" alerts**: pending jobs whose reason matches `never_run_reasons`
+  (DependencyNeverSatisfied, PartitionTimeLimit, QOSMax*PerJob*, held, SGE Eqw … see
+  config.example.yaml) get an alert at the top and no start estimate.
+- **Waiting on dependencies**: in "mine" counts, jobs waiting on dependencies aren't counted
+  as pending; they're shown in brackets after running, e.g. `2 (+5) / 98`.
 - **More files**: add patterns to `inspect_files`, e.g. `OSZICAR`, `slurm-{id}.out`.
 - **Dependency history incomplete**: increase `history_hours` (sacct range); too large
   makes each refresh slower.
 - **View from phone / other machines**: set `host` in `config.yaml` to `0.0.0.0` and use
   your workstation's LAN IP. Anyone on that network can then see your job names, paths
-  and output files; restrict access with your firewall.
+  and output files; restrict who can open it with `allow_from` (IPs / subnets, others get
+  403), e.g. `allow_from: [127.0.0.1, "::1", 192.168.192.0/24]`, or with your firewall.
 - **SGE output files**: SGE writes `jobname.o12345`; give that cluster its own
   `inspect_files` with `"*.o{id}"`.
 
@@ -275,6 +354,24 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
   就把 `waitlog/` 打包成 `waitlog_backups/waitlog-YYYYmmdd-HHMMSS.tar.gz`，只保留最新的
   `waitlog_backup_keep`（默认 10）份。自动刷新不会备份；上次备份之后没有变化也不会再备份。
 
+### 排队预测（predictor.py）
+
+"排队预测"（在 QoS 树下面，默认收起）里点**训练 / 更新模型**，就用 waitlog 的数据训练一个
+小模型（几秒；需要 scikit-learn，存到 `models/wait_model.pkl`，启动时自动加载）。之后：
+
+- Jobs 表"时间"列里每个排队的 job 多一个紫色的**模型**预计开始时间（鼠标悬停看 q20–q80
+  范围）。还在等依赖的 job：开始时间 = 前置 job 结束（开始 + 时限，偏保守）+ 预测的排队时间；
+- "预测交到哪里"：填核数 / GPU / 节点 / 时长，按最近一次刷新的排队状态，把所有放得下的
+  QoS + 分区按预计排队时间排好。
+
+模型：scikit-learn HistGradientBoosting，分位数损失（q20 / q50 / q80），每个集群一组（数据太少的
+集群用全局模型），QoS / 分区是特征。输入：申请的资源，以及 job **可以排队那一刻**的状态（QoS 和
+分区的运行 / 排队数、积压估计、Slurm 的估计和原因、已经排了多久、有没有 / 等了多久依赖）。
+等待一律从 eligible 算起。一起交的一批 job 只算一份，越旧的数据权重越小
+（`wait_model_half_life_days`）。每次训练都会按时间回测，和"历史分位数"比，哪个集群历史分位数
+更准就用它；回测表在页面上能看到。历史数据不到 3 批的预测显示成灰色（"数据少"）。
+刷新越频繁（`auto_refresh_minutes: 15`），数据越好。`python predictor.py` 训练并打印回测（不保存）。
+
 ### 装成 systemd 服务（开机自启）
 
 `python3 install.py` 最后一步会问要不要装（会执行 `sudo` 命令、提示输密码）；
@@ -287,23 +384,27 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
 
 ### 界面说明
 
-**QoS 面板**（每个集群一张卡片）
-- 我的 = 你在这个 QoS 上 运行 / 排队 的 job 数
-- 全集群 = 所有用户在这个 QoS 上 运行 / 排队 的数量，排队多说明挤。有的集群
-  （比如设置了 PrivateData）squeue 只能看到自己的 job，这一列会显示"隐藏"
-- MaxJobs / MaxSubmit / MaxWall / MaxTRES/人 = sacctmgr 里的每人限额；运行数或提交
-  数到顶了会标"运行已满"/"提交已满"
-- 点一行 = 下面的 job 表只看这个 QoS，再点一次取消
-- QoS 列表默认自动查（sacctmgr assoc），也可以在 config.yaml 里每个集群下面写
-  `qos:` 手动指定，还能加备注
-
-**排队积压**（每个集群一张卡片）
-- 每个分区：总核数、总卡数、CPU 积压、各型号 GPU 积压。积压 = 把分区里所有 job 的
-  （剩余时长 × 核数/卡数）加起来 ÷ 总核数/卡数，即"完美排满时清空现有的活要多久"
-- 范围 Local – Global：前者只算本分区，后者把共享同一批节点的分区都算上
-- GPU 池：每种卡一共几张，被哪些分区共用
-- 插队：比你在同分区最早排队的 job 晚提交、却已经在跑的别人的 job（通常靠 backfill）
-- 看不到其他用户 job 的集群（bluebear）没法估计，会写一行说明
+**QoS / 分区 / 积压**（每个集群一张卡片，树状：QoS → 它能用的分区）
+- Slurm 里**分区** = 一批节点（job 在哪跑），**QoS** = 一套规则（每人上限、最长时间、
+  优先级）。每个 job 选一个 QoS 加一个或几个分区，两者是多对多，不是包含关系。每个 QoS
+  下面挂它能用的分区：按分区的 `AllowQos` / `DenyQos`（`scontrol show partition`）；
+  `AllowQos=ALL` 时按实际见过的组合（全集群的 job + 你自己的 job，包括已结束的），你只有
+  一个 QoS 时所有分区都挂在它下面。没挂到任何 QoS 下面的放进"其他分区"（默认收起）。
+  可以在 config.yaml 这个集群下面手动指定：`qos_partitions: {bbgpu: [icelake-gpua100-shared]}`
+- QoS 行：我的 / 全集群 = 这个 QoS 的 运行 / 排队（只能看到自己 job 的集群显示"隐藏"）、
+  MaxWall、sacctmgr 里的每人限额（MaxJobs / MaxSubmit / MaxTRES）；运行数或提交数到顶
+  会标"运行已满"/"提交已满"
+- 分区行（点 QoS 前面的 ▶）：这个 QoS 在这个分区的 我的 / 全集群，节点和 CPU 的
+  已用 / 空闲 / 总数（`sinfo`；不让用 sinfo 的集群只有 `scontrol` 给的总数），CPU / GPU
+  积压，时限，以及分区自己的 QoS 和限额（比如 sulis 的 `part_compute`，对这个分区里所有
+  job 生效）
+- 积压 = 把分区里所有 job 的（剩余时长 × 核数/卡数）加起来 ÷ 总核数/卡数，即"完美排满
+  时清空现有的活要多久"；范围 Local – Global（只算本分区 – 算上共享同一批节点的分区）。
+  表格下面是 GPU 池和"插队"（比你在同分区最早排队的 job 晚提交、却已经在跑的别人的 job，
+  通常靠 backfill）。看不到其他用户 job 的集群（bluebear）没法估计，卡片底部会写一行说明
+- 点 QoS 行 = 下面的 job 表只看这个 QoS，点分区行 = 只看这个分区（点 "Jobs" 旁边的标签
+  取消）。排队时写了好几个分区的 job 每个分区都算一次。QoS 列表默认自动查（sacctmgr
+  assoc），也可以在 config.yaml 里每个集群下面写 `qos:` 手动指定，还能加备注
 
 **Job 表格**
 - 同一个集群里**名字相同**的 job（一般就是一条 dependency 链，或者同一批重复提交）
@@ -341,11 +442,6 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
     `loop_warn_ratio`、`loop_warn_extra_seconds`、`loop_warn_real_seconds`
   - 点 job id 跳过去，点路径复制
 
-- **分区**（在 QoS 和排队积压之间）：每个分区 你的 运行 / 排队、所有用户的 运行 / 排队、
-  节点和 CPU 的 已用 / 空闲 / 总数（`sinfo -o '%P|%a|%l|%F|%C'`）和时限；点一行按分区筛选
-  下面的 job（点 "Jobs" 旁边的标签取消）。排队时写了好几个分区的 job 每个分区都算一次。
-  不让用 `sinfo` 的集群（bluebear）只显示你自己那一列
-
 ### 调度系统（Slurm / SGE）
 
 `config.yaml` 里每个集群可以写 `scheduler: slurm`（默认）或 `scheduler: sge`。
@@ -360,7 +456,7 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
 | QoS 和限额（`qos_info`） | sacctmgr | 没有（QoS 面板按 project 分组，不显示限额列） |
 | 排队积压（`backlog`） | squeue + sinfo | 没有 |
 | 调度器预计开始时间（`est_start`） | squeue | 没有 |
-| 分区的节点 / CPU（`partition_info`） | sinfo | 没有（分区表按你的 job 的 PE 统计） |
+| 分区的节点 / CPU、AllowQos（`partition_info`） | sinfo + scontrol | 没有（分区表按你的 job 的 PE 统计） |
 
 单个集群可以用 `disable: [cluster_load, backlog]` 关掉某些功能，比如看不到别人 job 的集群
 （这个也会自动识别：全集群数字和你自己的一样时显示为"隐藏"）。SGE 没有 eligible
@@ -370,13 +466,21 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
 ### 常见调整
 
 - **只想看某几个集群**：在 `config.yaml` 里把不需要的集群 `enabled: false` 或删掉。
-- **想自动刷新**：`auto_refresh_minutes: 5`（SSH 有开销，别设太小）。
+- **自动刷新**："立即刷新"旁边的下拉框（关 / 6 / 12 / 24 小时，从上一次刷新算起，手动的也算；
+  存在 `.dashboard_settings.json`，比 config.yaml 里的 `auto_refresh_minutes` 优先）。
+- **隐藏分区**：现在没有 job 的分区自动收进"其他分区"；每个集群还可以在 `hide_partitions`
+  里写要隐藏的（支持通配符）。
+- **"不会开始"告警**：排队原因匹配 `never_run_reasons` 的 job（DependencyNeverSatisfied、
+  PartitionTimeLimit、QOSMax*PerJob*、被 hold、SGE 的 Eqw……见 config.example.yaml）在页面顶上告警，
+  也不给它预测开始时间。
+- **等依赖的 job**："我的"数字里不算排队，放在运行数后面的括号里，比如 `2 (+5) / 98`。
 - **想多看几个文件**：在 `inspect_files` 里加模式，比如 `OSZICAR`、`slurm-{id}.out`。
 - **依赖链历史看不全**：加大 `history_hours`（sacct 查询范围），但太大会让每次
   刷新变慢。
 - **想在手机/同事电脑上也能看**：把 `config.yaml` 里 `host` 改成 `0.0.0.0`，
   然后用你工作电脑的局域网 IP 访问。注意这样局域网内的人都能看到你的作业名字
-  等信息，公司网络环境要自己权衡安全性。
+  等信息。用 `allow_from` 限制谁能打开（IP 或网段，其他地址返回 403），比如
+  `allow_from: [127.0.0.1, "::1", 192.168.192.0/24]`。
 - **SGE 的输出文件**：SGE 写的是 `job名.o12345`，给这个集群单独写 `inspect_files`，
   加上 `"*.o{id}"`。
 

@@ -2,9 +2,12 @@ config.yaml
 config.yaml.bak.*
 .dashboard_cache.json
 .dashboard_cache.json.tmp
+.dashboard_settings.json
+.dashboard_settings.json.tmp
 __pycache__/
 *.bak
 waitlog/*.csv
 waitlog/*.old
 waitlog/*.tmp
 waitlog_backups/
+models/
