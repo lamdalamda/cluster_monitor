@@ -139,6 +139,8 @@ waitlog_backup_dir: waitlog_backups
 wait_model: true
 wait_model_path: models/wait_model.pkl
 wait_model_half_life_days: 14
+# 还没有模型时启动就自动训练；模型超过这么多天，刷新完自动重训（0 = 只手动训练）
+wait_model_retrain_days: 7
 
 # 排队原因匹配下面任意一个（通配符 * ?）就认为这个 job 永远不会开始（要改提交脚本 / 找管理员），
 # 页面顶上告警，也不给它预测开始时间。原因码见 https://slurm.schedmd.com/job_reason_codes.html

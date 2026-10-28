@@ -216,6 +216,7 @@ class Backend:
                 self.auto_minutes = int(json.load(f).get("auto_refresh_minutes", self.auto_minutes))
         except (OSError, ValueError, TypeError, AttributeError):
             pass
+        self.auto_train_tried = False
         self.auto_wake = threading.Event()  # 改了间隔 / 刷新完成：叫醒自动刷新线程重新算时间
 
     def clusters(self):
@@ -359,9 +360,12 @@ class Backend:
         for j in r.get("jobs", {}).values():
             reason = (j.get("reason") or "").strip("()") if j["state"] in PENDING else ""
             j["never_run"] = reason if reason and any(fnmatch.fnmatchcase(reason, p) for p in pats) else ""
+            # 在排队，但还在等前置 job：前端单独显示成"等依赖"，不算真正在排队
+            j["dep_wait"] = j["state"] in PENDING and waiting_on_dependency(j)
         if self.predictor and r.get("jobs"):
             try:
                 self.predictor.annotate(r)
+                self.predictor.annotate_overview(r)
             except Exception as e:  # noqa: BLE001  预测出错不影响刷新
                 r.setdefault("warnings", []).append(L(f"等待预测出错: {e}", f"Wait prediction failed: {e}"))
 
@@ -375,6 +379,21 @@ class Backend:
                     seen[id(r.get("jobs"))] = True
                     self.annotate(r)
             self.version += 1
+
+    def maybe_train_model(self):
+        """还没有模型，或者模型超过 wait_model_retrain_days 天：自动训练一次（后台，几秒）"""
+        p = self.predictor
+        if not p or not p.available or p.training or not self.waitlog:
+            return
+        days = self.config.get("wait_model_retrain_days", 7) or 0
+        meta = p.bundle["meta"] if p.bundle else None
+        if meta and (not days or (datetime.now() - datetime.fromisoformat(meta["trained_at"])).days < days):
+            return
+        if not meta:  # 还没有模型（或者旧模型读不了）：每次启动只自动试一次，失败了（比如数据太少）等手动
+            if self.auto_train_tried:
+                return
+            self.auto_train_tried = True
+        self.train_model()
 
     def train_model(self):
         """在自己的线程里训练（几秒），不占 SSH 队列。返回 False = 已经在训练了"""
@@ -468,6 +487,7 @@ class Backend:
             self.last_refresh = now_iso()
             self.results.get("_errors", {}).pop("worker", None)
         self.auto_wake.set()  # 自动刷新从这次刷新重新计时
+        self.maybe_train_model()
 
     def store_result(self, r):
         name = r["name"]
@@ -574,6 +594,7 @@ class Backend:
     def start(self):
         threading.Thread(target=self.worker, daemon=True).start()
         threading.Thread(target=self.auto_refresh_loop, daemon=True).start()
+        self.maybe_train_model()  # 第一次用：还没有模型就先训练一个
         # 默认不自动刷新；但如果一次都没拉过（没有缓存），启动时拉一次
         if self.config.get("refresh_on_start", False) or not self.last_good:
             self.enqueue_refresh(force=True)

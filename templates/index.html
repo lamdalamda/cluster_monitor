@@ -172,8 +172,12 @@
   .ml .rng{color:var(--muted);font-size:12px;margin-left:4px;}
   .est.ml-est .lbl{color:#b39ddb;}
   .dep-n{color:#b39ddb;}
-  #mlRec{font-size:13px;font-weight:400;}
-  #mlRec b{color:var(--ok);}
+  .tag.fast{background:#1d3324;color:var(--ok);}
+  .qos .rng{color:var(--muted);font-size:11px;margin-left:4px;}
+  #recBanner{margin:0 0 12px;padding:9px 14px;border:1px solid #2c5a3a;background:#14261b;border-radius:8px;font-size:14px;}
+  #recBanner:empty{display:none;}
+  #recBanner b{color:var(--ok);}
+  #recBanner button{font-size:12px;padding:2px 9px;margin-left:8px;}
   #mlBest{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 10px;font-size:13px;}
   #mlBest .c{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:4px 10px;}
   #autoSel{font-size:12px;}
@@ -200,6 +204,7 @@
     <option value="active" data-i18n="f_active"></option>
     <option value="running" data-i18n="f_running"></option>
     <option value="pending" data-i18n="f_pending"></option>
+    <option value="dep" data-i18n="f_dep"></option>
     <option value="done" data-i18n="f_done"></option>
     <option value="failed" data-i18n="f_failed"></option>
   </select>
@@ -216,6 +221,7 @@
 <main>
   <div id="alerts"></div>
   <div id="errors"></div>
+  <div id="recBanner"></div>
 
   <h2><span data-i18n="ov_title"></span> <button id="ovToggle"></button>
     <span class="muted" data-i18n="ov_hint"></span></h2>
@@ -224,7 +230,7 @@
   <div id="ovGrid"></div>
 
   <h2 id="mlH"><span data-i18n="ml_title"></span> <button id="mlToggle"></button>
-    <button id="mlTrain"></button> <span id="mlRec"></span> <span class="muted" data-i18n="ml_hint"></span></h2>
+    <button id="mlTrain"></button> <span class="muted" data-i18n="ml_hint"></span></h2>
   <div id="mlWrap">
     <details class="how"><summary data-i18n="ml_how"></summary><div data-i18n-html="ml_how_body"></div></details>
     <div id="mlStatus" class="card"></div>
@@ -284,8 +290,8 @@ const I18N = {
     never_refreshed: "还没刷新过",
     updated_at: s => "数据更新于 " + s,
     all_clusters: "所有集群", all_qos: "所有 QoS",
-    f_all_states: "全部状态", f_active: "活跃（运行+排队）", f_running: "运行中", f_pending: "排队中",
-    f_done: "已结束", f_failed: "最近一个失败/取消",
+    f_all_states: "全部状态", f_active: "活跃（运行+排队）", f_running: "运行中", f_pending: "排队中（不含等依赖）",
+    f_dep: "等依赖", f_done: "已结束", f_failed: "最近一个失败/取消",
     search_ph: "搜索 job id / 名字 / 节点 / QoS",
     refresh: "立即刷新", refreshing: "刷新中…", queued_btn: "已加入队列",
     collapse: "收起", expand: "展开", expand_all: "全部展开", collapse_all: "全部收起", show_all: "显示全部",
@@ -399,9 +405,14 @@ const I18N = {
     ml_nodes: "节点", ml_time: "时长 (h)", ml_go: "预测交到哪里", ml_form_hint: "按当前（最近一次刷新）的排队状态预测，列出能放下这个 job 的 QoS + 分区",
     th_ml_wait: "预计排队", th_ml_start: "预计开始", th_ml_pd: "现在排队", th_ml_mine: "我的 运行/排队", th_ml_n: "历史数据",
     ml_few: "数据少", ml_best: "推荐", ml_no_fit: "没有能放下这个 job 的 QoS + 分区（看看 GPU / 时长 / 核数）",
-    ml_rec: (form, best, next) => `推荐（${form}）：<b>${best}</b>${next ? `，其次 ${next}` : ""}`,
+    ml_rec: (form, best, next) => `现在交一个 ${form} 的 job，等待最短：<b>${best}</b>${next ? `，其次 ${next}` : ""}`,
     ml_rec_form: f => `${f.cpus} 核${f.gpus ? ` · ${f.gpus} GPU` : ""}${f.nodes > 1 ? ` · ${f.nodes} 节点` : ""} · ${f.time_h}h`,
-    ml_best_title: "各集群最快：", ml_rec_none: "推荐：没有数据够的选项",
+    ml_best_title: "各集群最快：",
+    rec_edit: "改参数", rec_training: "⏱ 正在训练排队预测模型（几秒）…",
+    rec_no_model: "⏱ 还没有排队预测模型，训练一下就能看到“现在交哪里等得最短”（几秒）",
+    th_ml_col: "模型预测", th_ml_col_tip: "现在交一个“典型 job”要排多久（模型 q50，小字是 q20–q80）。典型 job = 你在这个 QoS + 分区交过的 job 的中位数；没交过就用你在这个集群的中位数。悬停看具体参数",
+    ml_tree_tip: (job, own, a, b, n) => `按 ${job} 的 job 估计（${own ? "你在这里交过的 job 的中位数" : "你没在这里交过，用你在这个集群的中位数"}）\n多半在 ${a} – ${b}\n历史上在这里开始过 ${n} 批 job`,
+    fastest: "最快", fastest_tip: "这个集群里模型预测排队最短的（数据够的）分区", ml_rec_none: "推荐：没有数据够的选项",
     auto_off: "自动刷新：关", auto_every: h => `自动：每 ${h}h`, auto_min: m => `自动：每 ${m} 分钟`,
     auto_next: s => `下次自动刷新：${s}`,
     ml_n_tip: "这个 QoS + 分区历史上开始过几批 job（一起交的算一批；少于 3 批的预测不可靠，排在后面）",
@@ -410,7 +421,7 @@ const I18N = {
     never_refreshed: "Not refreshed yet",
     updated_at: s => "Updated " + s,
     all_clusters: "All clusters", all_qos: "All QoS",
-    f_all_states: "All states", f_active: "Active (running + pending)", f_running: "Running", f_pending: "Pending",
+    f_all_states: "All states", f_active: "Active (running + pending)", f_running: "Running", f_pending: "Pending (not deps)", f_dep: "Waiting on deps",
     f_done: "Finished", f_failed: "Last one failed/cancelled",
     search_ph: "Search job id / name / node / QoS",
     refresh: "Refresh", refreshing: "Refreshing…", queued_btn: "Queued",
@@ -525,9 +536,14 @@ const I18N = {
     ml_nodes: "Nodes", ml_time: "Time (h)", ml_go: "Where to submit", ml_form_hint: "Uses the current (latest refresh) queue state; lists every QoS + partition that fits this job",
     th_ml_wait: "Expected wait", th_ml_start: "Expected start", th_ml_pd: "Pending now", th_ml_mine: "Mine run/pend", th_ml_n: "History",
     ml_few: "little data", ml_best: "best", ml_no_fit: "No QoS + partition fits this job (check GPUs / time / cores)",
-    ml_rec: (form, best, next) => `Best for ${form}: <b>${best}</b>${next ? `, then ${next}` : ""}`,
+    ml_rec: (form, best, next) => `Shortest wait for a ${form} job right now: <b>${best}</b>${next ? `, then ${next}` : ""}`,
     ml_rec_form: f => `${f.cpus} cores${f.gpus ? ` · ${f.gpus} GPU` : ""}${f.nodes > 1 ? ` · ${f.nodes} nodes` : ""} · ${f.time_h}h`,
-    ml_best_title: "Fastest per cluster:", ml_rec_none: "Recommendation: no option with enough data",
+    ml_best_title: "Fastest per cluster:",
+    rec_edit: "Change", rec_training: "⏱ Training the wait-prediction model (a few seconds)…",
+    rec_no_model: "⏱ No wait-prediction model yet; train one to see where a job would start soonest (a few seconds)",
+    th_ml_col: "Model", th_ml_col_tip: "How long a “typical job” submitted now would wait (model q50; small text = q20–q80). Typical job = median of your jobs in this QoS + partition, else your median on this cluster. Hover for the parameters",
+    ml_tree_tip: (job, own, a, b, n) => `For a ${job} job (${own ? "median of your jobs here" : "you haven't submitted here; your median on this cluster"})\nLikely ${a} – ${b}\n${n} batches started here before`,
+    fastest: "fastest", fastest_tip: "The partition on this cluster with the shortest predicted wait (with enough data)", ml_rec_none: "Recommendation: no option with enough data",
     auto_off: "Auto refresh: off", auto_every: h => `Auto: every ${h}h`, auto_min: m => `Auto: every ${m} min`,
     auto_next: s => `Next auto refresh: ${s}`,
     ml_n_tip: "Batches of jobs that started in this QoS + partition before (jobs submitted together = one batch; under 3 = unreliable, sorted last)",
@@ -550,13 +566,13 @@ function applyStatic(){
 
 const STATE_COLOR = {
   RUNNING:"#2ecc71", COMPLETING:"#27ae60", CONFIGURING:"#27ae60",
-  PENDING:"#f1c40f", SUSPENDED:"#9b59b6", REQUEUED:"#f39c12", REQUEUE_HOLD:"#f39c12",
+  PENDING:"#f1c40f", DEPEND:"#b39ddb", SUSPENDED:"#9b59b6", REQUEUED:"#f39c12", REQUEUE_HOLD:"#f39c12",
   COMPLETED:"#6b7385", CANCELLED:"#e67e22", FAILED:"#e74c3c", TIMEOUT:"#c0392b",
   NODE_FAIL:"#c0392b", OUT_OF_MEMORY:"#c0392b", PREEMPTED:"#c0392b", BOOT_FAIL:"#c0392b", DEADLINE:"#c0392b",
 };
-const SHORT = {RUNNING:"R",COMPLETING:"CG",CONFIGURING:"CF",PENDING:"PD",SUSPENDED:"S",REQUEUED:"RQ",
+const SHORT = {RUNNING:"R",COMPLETING:"CG",CONFIGURING:"CF",PENDING:"PD",DEPEND:"DEP",SUSPENDED:"S",REQUEUED:"RQ",
   COMPLETED:"CD",CANCELLED:"CA",FAILED:"F",TIMEOUT:"TO",NODE_FAIL:"NF",OUT_OF_MEMORY:"OOM",PREEMPTED:"PR"};
-const ORDER = ["RUNNING","COMPLETING","CONFIGURING","PENDING","SUSPENDED","REQUEUED","COMPLETED",
+const ORDER = ["RUNNING","COMPLETING","CONFIGURING","PENDING","DEPEND","SUSPENDED","REQUEUED","COMPLETED",
   "FAILED","TIMEOUT","OUT_OF_MEMORY","NODE_FAIL","PREEMPTED","CANCELLED"];
 const ACTIVE = new Set(["RUNNING","COMPLETING","CONFIGURING"]);
 const PEND = new Set(["PENDING","SUSPENDED","REQUEUED","REQUEUE_HOLD","RESV_DEL_HOLD"]);
@@ -588,6 +604,9 @@ let lastData = null;
 let jobsByKey = {};
 let groupOfJob = {};
 
+// 显示用的状态：排队中但还在等前置 job 的显示成 DEPEND（不算真正在排队）
+const dispState = j => PEND.has(j.state) && j.dep_wait ? "DEPEND" : j.state;
+const queueing = j => PEND.has(j.state) && !j.dep_wait;
 function stBadge(s){
   return `<span class="st ${LIGHT_TEXT.has(s) ? "light" : ""}" style="--c:${colorFor(s)}">${esc(s)}</span>`;
 }
@@ -605,11 +624,11 @@ function buildGroups(jobs){
   for (const g of groups){
     g.jobs.sort((a, b) => idNum(a) - idNum(b) || a.id.localeCompare(b.id));
     // 代表这一组的 job：正在跑的 > 下一个排队的 > 最后一个
-    g.rep = g.jobs.find(j => ACTIVE.has(j.state)) || g.jobs.find(j => PEND.has(j.state)) || g.jobs[g.jobs.length - 1];
+    g.rep = g.jobs.find(j => ACTIVE.has(j.state)) || g.jobs.find(queueing) || g.jobs.find(j => PEND.has(j.state)) || g.jobs[g.jobs.length - 1];
     g.rank = ACTIVE.has(g.rep.state) ? 0 : PEND.has(g.rep.state) ? 1 : 2;
     g.maxId = Math.max(...g.jobs.map(idNum));
     g.counts = {};
-    for (const j of g.jobs) g.counts[j.state] = (g.counts[j.state] || 0) + 1;
+    for (const j of g.jobs) g.counts[dispState(j)] = (g.counts[dispState(j)] || 0) + 1;
     g.qosList = [...new Set(g.jobs.map(j => j.qos).filter(Boolean))];
     g.nRunning = g.jobs.filter(j => ACTIVE.has(j.state)).length;
   }
@@ -631,7 +650,8 @@ function groupVisible(g){
   switch (filters.state){
     case "active":  if (g.rank > 1) return false; break;
     case "running": if (g.rank !== 0) return false; break;
-    case "pending": if (!g.jobs.some(j => PEND.has(j.state))) return false; break;
+    case "pending": if (!g.jobs.some(queueing)) return false; break;
+    case "dep":     if (!g.jobs.some(j => PEND.has(j.state) && j.dep_wait)) return false; break;
     case "done":    if (g.rank !== 2) return false; break;
     case "failed":  if (g.rank !== 2 || !BAD.has(s)) return false; break;
   }
@@ -707,7 +727,7 @@ function jobCells(j, nameHtml){
   return `<td class="name" title="${esc(jobTip(j))}">${nameHtml}</td>
     <td>${esc(j.cluster)}</td>
     <td class="jid" data-copy="${esc(j.id)}" title="${t("click_copy")}">${esc(j.id)}</td>
-    <td>${stBadge(j.state)}</td>
+    <td>${stBadge(dispState(j))}</td>
     <td>${esc(j.qos || "-")}</td>
     <td class="part" title="${esc(j.partition)}">${esc(j.partition || "-")}</td>
     <td class="where" title="${esc(j.nodelist || j.reason)}">${whereCell(j)}</td>
@@ -730,7 +750,7 @@ function groupRow(g){
     <td class="name" title="${esc(g.name)}  (${t("n_jobs", g.jobs.length)})">${esc(g.name)}<span class="count">×${g.jobs.length}</span></td>
     <td>${esc(g.cluster)}</td>
     <td class="jid" data-copy="${esc(j.id)}" title="${t("click_copy")}">${esc(j.id)}</td>
-    <td>${stBadge(j.state)}<span class="cnts">${countPills(g)}</span></td>
+    <td>${stBadge(dispState(j))}<span class="cnts">${countPills(g)}</span></td>
     <td>${esc(g.qosList.join(", ") || "-")}</td>
     <td class="part" title="${esc(j.partition)}">${esc(j.partition || "-")}</td>
     <td class="where" title="${esc(j.nodelist || j.reason)}">${where}</td>
@@ -891,9 +911,20 @@ function overviewCard(c){
     all: hasF(c, "cluster_load"),
     nodes: parts.some(p => p.nodes), cpus: parts.some(p => p.cpus),
     bl: parts.some(p => p.backlog),
+    ml: ov.groups.some(g => g.children.some(ch => ch.ml)),
     lim: hasF(c, "qos_info"),
   };
-  const nCols = 4 + col.all + col.nodes + col.cpus + 2 * col.bl + col.lim;
+  const nCols = 4 + col.all + col.nodes + col.cpus + 2 * col.bl + col.ml + col.lim;
+  // 模型预测：每个分区按"你在这里交过的典型 job"现在交要排多久；这个集群里最快的（数据够的）标"最快"
+  let fastest = null;
+  for (const g of ov.groups) for (const ch of g.children)
+    if (ch.ml && !ch.hidden && ch.ml.n_seen >= 3 && (!fastest || ch.ml.wait[1] < fastest.ml.wait[1])) fastest = {...ch, qos: g.qos};
+  const mlCell = m => {
+    if (!m) return `<td><span class="n-0">—</span></td>`;
+    const [a, b, d] = m.wait, few = m.n_seen < 3, j = m.job;
+    const tip = t("ml_tree_tip", t("ml_rec_form", {cpus: j.cpus, gpus: j.gpus, nodes: j.nodes, time_h: Math.round(j.time_h * 10) / 10}), j.own, fmtH(a), fmtH(d), m.n_seen);
+    return `<td title="${esc(tip)}"><span class="${few ? "n-0" : hCls(b)}">~${fmtH(b)}</span><span class="rng">${fmtH(a)} – ${fmtH(d)}</span>${few ? ` <span class="tag full">${t("ml_few")}</span>` : ""}</td>`;
+  };
   const loadTip = c.load_private ? t("load_private_tip") : t("load_tip");
   const allCell = r => !col.all ? "" : `<td title="${esc(loadTip)}">${c.load_private ? `<span class="n-0">${t("hidden")}</span>` : pairCell(r, "all")}</td>`;
 
@@ -908,12 +939,13 @@ function overviewCard(c){
     const pq = p.part_qos ? `<span title="${esc(t("part_qos_tip"))}">${esc(p.part_qos)}</span>${p.part_qos_limits ? ": " + limitsText(p.part_qos_limits) : ""}` : "";
     return `<tr class="lvl1 ${under} ${mine ? "mine-row" : "idle"} ${down ? "down" : ""} ${filters.part === key ? "sel" : ""}" data-part="${esc(key)}">
       <td class="tog"></td>
-      <td class="qname">${esc(pname)}${p.default ? `<span class="tag cfg">${t("part_default")}</span>` : ""}${under && p.hidden ? `<span class="tag cfg">${t(p.hidden === "config" ? "hidden_config" : "hidden_empty")}</span>` : ""}${down ? `<span class="tag subfull">${esc(p.avail)}</span>` : ""}</td>
+      <td class="qname">${esc(pname)}${!under && fastest && fastest.name === pname && counts.ml && counts.ml.wait[1] === fastest.ml.wait[1] ? `<span class="tag fast" title="${esc(t("fastest_tip"))}">${t("fastest")}</span>` : ""}${p.default ? `<span class="tag cfg">${t("part_default")}</span>` : ""}${under && p.hidden ? `<span class="tag cfg">${t(p.hidden === "config" ? "hidden_config" : "hidden_empty")}</span>` : ""}${down ? `<span class="tag subfull">${esc(p.avail)}</span>` : ""}</td>
       <td class="mine" title="${esc(t("part_multi_tip"))}">${pairCell(counts, "mine")}</td>
       ${col.all ? `<td title="${esc(t("part_multi_tip"))}">${c.load_private ? `<span class="n-0">—</span>` : pairCell(counts, "all")}</td>` : ""}
       ${col.nodes ? `<td title="${esc(t("nodes_tip"))}">${useCell(p.nodes)}</td>` : ""}
       ${col.cpus ? `<td title="${esc(t("nodes_tip"))}">${useCell(p.cpus)}</td>` : ""}
       ${col.bl ? `<td title="${esc(t("bl_range_tip"))}">${b ? fmtRange(b.cpu_min, b.cpu_max) : `<span class="n-0">—</span>`}</td><td>${gpu}</td>` : ""}
+      ${col.ml ? mlCell(counts.ml) : ""}
       <td class="lim">${esc(p.time_limit || "-")}</td>
       ${col.lim ? `<td class="limits">${pq}</td>` : ""}
     </tr>`;
@@ -935,7 +967,7 @@ function overviewCard(c){
       <td class="qname">${esc(q.name)}${tags}${q.note ? `<span class="note">${esc(q.note)}</span>` : ""}${!open && shown.length ? `<span class="count">${esc(shown.map(x => x.name).join(", "))}</span>` : ""}</td>
       <td class="mine">${pairCell(q, "mine")}</td>
       ${allCell(q)}
-      ${col.nodes ? "<td></td>" : ""}${col.cpus ? "<td></td>" : ""}${col.bl ? "<td></td><td></td>" : ""}
+      ${col.nodes ? "<td></td>" : ""}${col.cpus ? "<td></td>" : ""}${col.bl ? "<td></td><td></td>" : ""}${col.ml ? (open ? "<td></td>" : mlCell(g.ml)) : ""}
       <td class="lim" title="${esc(t("th_maxwall_tip"))}">${esc(q.max_wall || "-")}</td>
       ${col.lim ? `<td class="limits">${limitsText(q)}</td>` : ""}
     </tr>`);
@@ -974,6 +1006,7 @@ function overviewCard(c){
         ${col.nodes ? `<th title="${esc(t("nodes_tip"))}">${t("th_nodes")}</th>` : ""}
         ${col.cpus ? `<th title="${esc(t("nodes_tip"))}">${t("th_cpus2")}</th>` : ""}
         ${col.bl ? `<th title="${esc(t("bl_range_tip"))}">${t("th_cpu_bl")}</th><th>${t("th_gpu_bl")}</th>` : ""}
+        ${col.ml ? `<th title="${esc(t("th_ml_col_tip"))}">${t("th_ml_col")}</th>` : ""}
         <th>${t("th_tlimit")}</th>${col.lim ? `<th>${t("th_limits")}</th>` : ""}</tr></thead>
       <tbody>${rows.join("") || `<tr><td colspan="${nCols}" class="empty">${t("no_qos")}</td></tr>`}</tbody>
     </table>${foot}</div>`;
@@ -1096,7 +1129,8 @@ function renderModel(){
   tb.textContent = m.training ? t("ml_training") : t("ml_train");
   const recKey = m.meta ? [lastData.updated_at, m.meta.trained_at, JSON.stringify(mlForm)].join("|") : "";
   if (recKey && recKey !== mlKey){ mlKey = recKey; runSuggest(); }
-  if (!m.meta){ mlItems = null; document.getElementById("mlRec").innerHTML = ""; }
+  if (!m.meta) mlItems = null;
+  renderRec();
   if (mlCollapsed) return;
   const st = document.getElementById("mlStatus");
   const meta = m.meta;
@@ -1136,10 +1170,17 @@ function renderModel(){
 }
 
 function renderRec(){
-  const rec = document.getElementById("mlRec"), best = document.getElementById("mlBest");
+  const rec = document.getElementById("recBanner"), best = document.getElementById("mlBest");
+  const m = (lastData && lastData.model) || {};
   const ok = (mlItems || []).filter(c => c.n_seen >= 3);
   const name = c => `${esc(c.cluster)} ${esc(c.qos)}/${esc(c.partition)} ~${fmtH(c.wait[1])}${c.stale ? t("al_stale") : ""}`;
-  rec.innerHTML = !mlItems ? "" : ok.length ? t("ml_rec", t("ml_rec_form", mlForm), name(ok[0]), ok[1] ? name(ok[1]) : "") : `<span class="muted">${t("ml_rec_none")}</span>`;
+  const edit = `<button data-rec-edit>${t("rec_edit")}</button>`;
+  rec.innerHTML = !m.enabled || !m.available ? ""
+    : m.training && !m.meta ? `<span class="muted">${t("rec_training")}</span>`
+    : !m.meta ? `${t("rec_no_model")}<button data-rec-train>${t("ml_train")}</button>`
+    : !mlItems ? ""
+    : ok.length ? `⏱ ${t("ml_rec", t("ml_rec_form", mlForm), name(ok[0]) + `<span class="muted"> (${fmtH(ok[0].wait[0])} – ${fmtH(ok[0].wait[2])})</span>`, ok[1] ? name(ok[1]) : "")}${edit}`
+    : `<span class="muted">${t("ml_rec_none")}</span>${edit}`;
   const per = [];
   for (const c of ok) if (!per.some(x => x.cluster === c.cluster)) per.push(c);
   best.innerHTML = per.length > 1 ? `<span class="muted">${t("ml_best_title")}</span>` + per.map(c =>
@@ -1184,6 +1225,16 @@ document.getElementById("mlForm").addEventListener("submit", e => {
   mlForm = {cluster: v("mlCluster"), cpus: +v("mlCpus") || 1, gpus: +v("mlGpus") || 0, nodes: +v("mlNodes") || 1, time_h: +v("mlTime") || 0};
   savePref("mlForm", mlForm);
   runSuggest();
+});
+document.getElementById("recBanner").addEventListener("click", async e => {
+  if (e.target.closest("[data-rec-edit]")){
+    mlCollapsed = false; savePref("mlCollapsed", false); renderModel();
+    document.getElementById("mlH").scrollIntoView({behavior: "smooth"}); document.getElementById("mlCpus").focus();
+  } else if (e.target.closest("[data-rec-train]")){
+    e.target.disabled = true;
+    try{ await fetch("api/model/train", {method: "POST"}); }catch(err){}
+    kick();
+  }
 });
 document.getElementById("mlToggle").addEventListener("click", () => { mlCollapsed = !mlCollapsed; savePref("mlCollapsed", mlCollapsed); renderModel(); });
 document.getElementById("mlTrain").addEventListener("click", async () => {

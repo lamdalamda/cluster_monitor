@@ -746,6 +746,40 @@ class Predictor:
                 "at": now.strftime("%Y-%m-%dT%H:%M:%S"),
             }
 
+    def annotate_overview(self, result):
+        """QoS 树里每个 QoS → 分区 加上 ml：{"wait": [q20, q50, q80]（现在交一个典型 job 要排多久）,
+        "job": 用的典型 job, "n_seen"}；QoS 那一行取它下面最快的分区"""
+        ov = result.get("overview") or {}
+        for g in ov.get("groups", []):
+            g.pop("ml", None)
+            for ch in g["children"]:
+                ch.pop("ml", None)
+        if not self.bundle or not ov.get("groups"):
+            return
+        ctx = context_of(result)
+        jobs = result.get("jobs", {})
+        items, samples = [], []
+        for g in ov["groups"]:
+            max_wall = (ctx["qos"].get(g["qos"]) or {}).get("max_wall")
+            for ch in g["children"]:
+                p = ch["name"]
+                info = ov.get("partitions", {}).get(p, {})
+                bl = ctx["bl"].get(p)
+                is_gpu = bool(bl and bl.get("gpus")) or "gpu" in p.lower()
+                lim_h = time_cap(info, max_wall)
+                job = typical_job(jobs, g["qos"], p, is_gpu, lim_h)
+                items.append((g, ch, job))
+                samples.append(new_job_sample(ctx, g["qos"], p, job["cpus"], job["gpus"], job["nodes"],
+                                              job["time_h"]))
+        if not samples:
+            return
+        P = self.bundle["model"].predict(samples)
+        for (g, ch, job), row in zip(items, P):
+            ch["ml"] = {"wait": [fmt_q(float(x)) for x in row], "job": job,
+                        "n_seen": self.n_seen(result["name"], g["qos"], ch["name"])}
+            if ch["ml"]["n_seen"] >= FEW_SEEN and (not g.get("ml") or ch["ml"]["wait"][1] < g["ml"]["wait"][1]):
+                g["ml"] = {**ch["ml"], "partition": ch["name"]}
+
     def suggest(self, results, req, now=None):
         """新 job 交到哪里最快。req: {cpus, gpus, gpu_type, nodes, time_h, cluster}
         results: {集群名: poll_cluster 的结果}。返回按 q50 排好的候选（数据太少的排后面）"""
@@ -783,11 +817,7 @@ class Predictor:
                     bl = ctx["bl"].get(p)
                     if unfit(info, bl, p, cpus, gpus, nodes, time_h, limits.get(qos, {}).get("max_wall")):
                         continue
-                    samples.append({"reason": "", "cpus": cpus, "gpus": gpus, "nodes": nodes,
-                                    "time_limit_h": time_h, "mem_gb": math.nan, "n_partitions": 1,
-                                    "waited_h": 0.0, "has_dep": 0.0, "dep_wait_h": 0.0,
-                                    "slurm_remaining_h": math.nan,
-                                    **state_features(ctx, qos, p, gpus, gtype)})
+                    samples.append(new_job_sample(ctx, qos, p, cpus, gpus, nodes, time_h, gtype))
                     cands.append({"cluster": name, "qos": qos, "partition": p,
                                   "n_seen": self.n_seen(name, qos, p),
                                   "model": self.bundle["model"].which(name),
@@ -806,6 +836,52 @@ class Predictor:
         return cands
 
 
+def new_job_sample(ctx, qos, partition, cpus, gpus, nodes, time_h, gpu_type=""):
+    """"现在交一个这样的新 job"的样本（没有依赖、刚开始排队）"""
+    return {"reason": "", "cpus": cpus, "gpus": gpus, "nodes": nodes, "time_limit_h": time_h,
+            "mem_gb": math.nan, "n_partitions": 1, "waited_h": 0.0, "has_dep": 0.0, "dep_wait_h": 0.0,
+            "slurm_remaining_h": math.nan, **state_features(ctx, qos, partition, gpus, gpu_type)}
+
+
+def median(xs):
+    xs = sorted(x for x in xs if not math.isnan(x))
+    return xs[len(xs) // 2] if xs else math.nan
+
+
+def typical_job(jobs, qos, partition, is_gpu, part_limit_h):
+    """QoS 树里每个分区按"你在这里交过的典型 job"预测：同 QoS + 分区的 job（排队 / 在跑 / 最近结束的）
+    核数、GPU、节点、时长取中位数；没交过就用你在这个集群上 CPU / GPU job 的中位数，
+    时长默认 24h（不超过分区上限）"""
+    def req(j):
+        _, g = backlog.parse_gpu(j.get("tres") or "")
+        if not g:
+            g = num((j.get("req_tres") or "").split("gres/gpu=")[1].split(",")[0]) \
+                if "gres/gpu=" in (j.get("req_tres") or "") else 0.0
+        t = backlog.parse_duration(j["time_limit"]) if j.get("time_limit") else math.nan
+        return num(j.get("cpus")), g or 0.0, num(j.get("nnodes")), t
+    here = [req(j) for j in jobs.values() if j.get("qos") == qos
+            and partition in (j.get("partition") or "").split(",")]
+    own = bool(here)
+    if not here:
+        here = [r for r in map(req, jobs.values()) if (r[1] > 0) == is_gpu]
+    cpus, gpus = median([r[0] for r in here]), median([r[1] for r in here])
+    nodes, time_h = median([r[2] for r in here]), median([r[3] for r in here])
+    if math.isnan(time_h):
+        time_h = 24.0
+    if part_limit_h:
+        time_h = min(time_h, part_limit_h)
+    return {"cpus": 1.0 if math.isnan(cpus) else cpus,
+            "gpus": (1.0 if is_gpu else 0.0) if math.isnan(gpus) or (is_gpu and not gpus) else gpus,
+            "nodes": 1.0 if math.isnan(nodes) else nodes, "time_h": time_h, "own": own}
+
+
+def time_cap(info, max_wall):
+    """最长能申请多久（小时）：分区上限、QoS 的 MaxWall、分区自己的 QoS 的 MaxWall 里最严格的；都没有返回 None"""
+    limits = (info.get("time_limit"), max_wall, (info.get("part_qos_limits") or {}).get("max_wall"))
+    hours = [backlog.parse_duration(x) for x in limits if x and x not in ("infinite", "UNLIMITED")]
+    return min(hours) if hours else None
+
+
 def unfit(info, bl, name, cpus, gpus, nodes, time_h, max_wall):
     """这个分区放不下这个 job 的原因（None = 可以）"""
     if info.get("avail") and info["avail"] not in ("up", "running"):
@@ -815,9 +891,8 @@ def unfit(info, bl, name, cpus, gpus, nodes, time_h, max_wall):
         return "no gpu"
     if gpus == 0 and has_gpu:
         return "gpu partition"
-    lims = [backlog.parse_duration(x) for x in (info.get("time_limit"), max_wall)
-            if x and x not in ("infinite", "UNLIMITED")]
-    if not math.isnan(time_h) and any(time_h > lim + 1e-6 for lim in lims):
+    cap = time_cap(info, max_wall)
+    if cap is not None and not math.isnan(time_h) and time_h > cap + 1e-6:
         return "time limit"
     tot = (info.get("cpus") or {}).get("total")
     if tot and cpus > tot:
