@@ -19,6 +19,7 @@ Backend（app.py）只管 SSH、缓存、合并结果、给前端的数据；每
 - backlog       排队积压估计（backlog.py，要看到全集群的 job 和分区）
 - est_start     调度器自己估计的开始时间
 - partition_info 每个分区的节点 / CPU 用量、时限、允许哪些 QoS（sinfo / scontrol）
+- fairshare     你的 fairshare、优先级各项、排队的 job 前面还有多少（sshare / sprio）
 """
 
 import re
@@ -27,13 +28,14 @@ from abc import ABC, abstractmethod
 ACTIVE = {"RUNNING", "COMPLETING", "CONFIGURING"}
 PENDING = {"PENDING", "SUSPENDED", "REQUEUED", "REQUEUE_HOLD", "RESV_DEL_HOLD"}
 
-ALL_FEATURES = {"history", "cluster_load", "qos_info", "backlog", "est_start", "partition_info"}
+ALL_FEATURES = {"history", "cluster_load", "qos_info", "backlog", "est_start", "partition_info", "fairshare"}
 
 
 class Scheduler(ABC):
     kind = ""            # config.yaml 里 scheduler: 的值
     qos_label = "QoS"    # 前端 QoS 面板的列名
     PARTITION_LOAD = False  # parse_combo_load 能给出全集群按 QoS × 分区的数字
+    HISTORY_SECTION = ""    # 历史记录（已结束的 job）是 steps() 里的哪一段
     FEATURES = frozenset()
 
     def __init__(self, cluster, config):
@@ -55,8 +57,8 @@ class Scheduler(ABC):
     def steps(self, want):
         """这次 SSH 要跑的命令 [(SECTION, cmd), ...]，SECTION 全大写。
         want: {"history_hours": int, "load": bool, "qos_info": bool, "backlog": bool,
-               "partition_info": bool}
-        （load / qos_info / backlog / partition_info 只在 has() 为真时才会是 True）"""
+               "partition_info": bool, "fairshare": bool}
+        （load / qos_info / backlog / partition_info / fairshare 只在 has() 为真时才会是 True）"""
 
     @abstractmethod
     def required_sections(self):
@@ -98,6 +100,12 @@ class Scheduler(ABC):
     def parse_qos_info(self, sections):
         """{"assoc": [能用的 QoS], "limits": {qos: {max_jobs_pu, max_submit_pu, max_wall, max_tres_pu}}}"""
         return {"assoc": [], "limits": {}}
+
+    def parse_fairshare(self, sections, jobs):
+        """{"accounts": [你的 sshare 行], "weights": {因子: 权重}, "sees_others": bool,
+            "users": {有排队 job 的用户数, fairshare 比你高的有几个},
+            "jobs": {jobid: 你排队中的 job 的优先级、各项、每个分区前面还有几个}}；拿不到返回 None"""
+        return None
 
     def analyze_backlog(self, sections):
         """返回 (给前端的 result, 给 estimate_job 用的 model)"""
@@ -141,6 +149,41 @@ def waiting_on_dependency(j):
     前置 job 结束之前排到队头也不会开始，不算真正在排队"""
     return (j.get("reason") or "").strip("()").startswith("Dependency") or any(
         d.get("status") == "unfulfilled" for d in j.get("deps", []))
+
+
+def dependency_sides(jobs):
+    """等依赖的排队 job 分两边：顺着依赖链往上找到不等依赖的前置 job（根），
+    根在跑 -> "run"（前置跑完就轮到它），根还在排队 / 找不到 -> "queue"。
+    依赖好几个的，只要有一个根在排队就算 "queue"。返回 {jobid: "run" | "queue"}"""
+    out = {}
+
+    def side(jid, seen):
+        if jid in out:
+            return out[jid]
+        j = jobs[jid]
+        deps = [d for d in j.get("deps", []) if d.get("id")]
+        todo = [d for d in deps if d.get("status") == "unfulfilled"] or deps
+        res = "run" if todo else "queue"
+        for d in todo:
+            t = jobs.get(d["id"])
+            if t is None or d["id"] in seen:
+                r = "queue"
+            elif t["state"] in ACTIVE:
+                r = "run"
+            elif t["state"] in PENDING and waiting_on_dependency(t):
+                r = side(d["id"], seen | {jid})
+            else:  # 前置在排队；或者已经结束了却还没满足（afterok 遇到失败，永远等不到）
+                r = "queue"
+            if r == "queue":
+                res = "queue"
+                break
+        out[jid] = res
+        return res
+
+    for jid, j in jobs.items():
+        if j["state"] in PENDING and waiting_on_dependency(j):
+            side(jid, frozenset())
+    return out
 
 
 def sort_jobid(jid):

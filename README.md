@@ -140,10 +140,12 @@ Model: scikit-learn HistGradientBoosting with quantile loss (q20 / q50 / q80), o
 cluster (global fallback for clusters with little data); QoS / partition are features.
 Inputs: requested resources and the queue state when the job became eligible (QoS and
 partition running / pending, backlog estimate, Slurm's estimate and reason, time already
-waited, whether / how long it waited on dependencies). Waits are always counted from
-eligible. Jobs submitted together count as one sample; older data is down-weighted
-(`wait_model_half_life_days`). Each training run backtests over time against "historical
-quantiles" and uses those instead on clusters where they did better; the backtest table is
+waited, whether / how long it waited on dependencies), your recent usage (CPU-hours with a
+7-day half-life, rebuilt from your own jobs in waitlog: what fairshare reacts to), cores you
+have running, and the hour / weekday. Waits are always counted from eligible. Jobs submitted together count as one sample; older data is down-weighted
+(`wait_model_half_life_days`). Each training run backtests day by day over the last 21 days
+(retrain on everything before each day, predict that day's jobs; ~35 s on 4 cores) against
+"historical quantiles" and uses those instead on clusters where they did better; the backtest table is
 shown in the page. Predictions with under 3 batches of history are greyed out ("little
 data"). Refreshing more often (`auto_refresh_minutes: 15`) gives the model much better data.
 `python predictor.py` trains and prints the backtest without saving.
@@ -161,6 +163,19 @@ config.yaml: `sudo systemctl restart hpc-dashboard`. Stop any manually started
 
 ### The page
 
+**Charts first, numbers on demand.** The QoS cards, Wait prediction, Jobs and Wait history
+sections show charts by default; the **Details** button next to each heading switches that
+section to the tables (remembered per browser). Hover any mark for its numbers.
+- QoS cards: node usage per partition (allocated / idle / down) with your counts and the
+  expected wait; for Slurm clusters that show other users' jobs, a **position** strip per
+  partition (where your queued jobs stand) over a histogram of other users' priorities.
+- Wait prediction: what the page predicted for each job vs how long it actually waited.
+- Jobs: a timeline, one row per name group: running time (faded = left until the time
+  limit) and the predicted start window; click a row to jump to it in the table.
+- Wait history: one time axis for your jobs (running / queued), your decayed usage (what
+  fairshare looks at), your jobs' priority when queued, and the actual waits
+  (`/api/trends`).
+
 **QoS / partitions / backlog** (one card per cluster, a tree: QoS → the partitions it can use)
 - In Slurm a **partition** is a set of nodes (where a job runs) and a **QoS** is a set of
   rules (per-user caps, max wall time, priority). A job picks one QoS and one or more
@@ -175,11 +190,15 @@ config.yaml: `sudo systemctl restart hpc-dashboard`. Stop any manually started
   MaxSubmit / MaxTRES per user); reaching the running / submit cap is flagged
 - Partition row (click ▶ on the QoS): Mine / Cluster for this QoS in this partition, nodes
   and CPUs allocated / idle / total (`sinfo`; only totals from `scontrol` where sinfo is
-  forbidden), CPU / GPU backlog, time limit, and the partition's own QoS with its limits
+  forbidden), expected wait, time limit, and the partition's own QoS with its limits
   (e.g. sulis' `part_compute`), which apply to every job in it
+- Expected wait: bold = the model's median for a typical job of yours submitted now, small
+  text = q20–q80, "≤ X" = the backlog estimate as an upper bound (hover for CPU / GPU
+  Local – Global)
 - Backlog = sum of (remaining time × cores/GPUs) over all jobs ÷ total cores/GPUs, i.e.
   "how long to clear the current work if it packed perfectly"; range Local – Global (this
-  partition only – including partitions sharing the same nodes). Under the table: GPU pools
+  partition only – including partitions sharing the same nodes). In practice it is an upper
+  bound: on young / sulis no batch out of 50 waited more than 36% of it. Under the table: GPU pools
   and "line cutters" (other users' jobs submitted after your earliest pending job in the
   same partition but already running, usually via backfill). Clusters that hide other
   users' jobs (bluebear) can't be estimated; the footer says so
@@ -187,6 +206,13 @@ config.yaml: `sudo systemctl restart hpc-dashboard`. Stop any manually started
   partition (click the chip next to "Jobs" to clear). A pending job listing several
   partitions is counted in each. The QoS list is discovered automatically (sacctmgr assoc);
   you can also list them under each cluster in config.yaml (`qos:`), with optional notes
+
+**Finished since last refresh** (above the job table)
+- Every job that ended between a cluster's previous successful refresh and this one, whether it
+  completed, failed, was cancelled or timed out, with its exit code (`sacct` ExitCode /
+  SGE exit_status). Problems are listed first; click a row to jump to it in the job table.
+  The state filter has a matching "Finished since last refresh" option. A job that was
+  running last time but is now in neither the queue nor the history is listed as "vanished"
 
 **Job table**
 - Jobs with the **same name** on a cluster (usually one dependency chain, or repeated
@@ -231,6 +257,27 @@ config.yaml: `sudo systemctl restart hpc-dashboard`. Stop any manually started
     `loop_warn_extra_seconds`, `loop_warn_real_seconds`
   - click a job id to jump to it, click a path to copy it
 
+### Plain-text view for Claude / curl (port 8786)
+The same data as the page, as aligned plain text, on `text_port` (default 8786, `0` = off;
+also under `/text/...` on the page's port). `allow_from` applies here too.
+```bash
+curl -s localhost:8786/                      # overview: clusters, alerts, finished since last refresh, running, queued groups
+curl -s "localhost:8786/jobs?state=failed"   # ?state=active|running|pending|dep|done|failed|just_done|all, ?cluster= ?q= ?flat=1 ?limit=
+curl -s "localhost:8786/job/sulis/2273176?read=1"  # one job + its folder (files, OUTCAR LOOP, tails); read=1 reads it first
+curl -s localhost:8786/done                  # jobs that ended between the last two refreshes
+curl -s "localhost:8786/qos?cluster=young"   # QoS -> partition tree with expected waits
+curl -s localhost:8786/fairshare             # Slurm fairshare vs other users, what priority depends on, queue position
+curl -s "localhost:8786/suggest?cpus=64&time_h=24"   # where a new job would start soonest
+curl -s -X POST localhost:8786/refresh       # refresh now, wait, then print the overview (?wait=0 to not wait)
+curl -s localhost:8786/help
+```
+Job lists show each job's (or group's) working folder in a `dir` column. Pending Slurm jobs show
+`#N/M @partition`: the position among eligible pending jobs in that partition (from `sprio`; jobs
+waiting on dependencies or held don't count, and backfill can still start small jobs out of order).
+The fairshare summary (`sshare -U`) says how your fairshare compares with the other users who have
+queued jobs and how many times your share you've used. Clusters that only show you your own jobs
+(e.g. bluebear) give no position. Not available on SGE.
+
 ### Schedulers (Slurm / SGE)
 
 Each cluster in `config.yaml` can set `scheduler: slurm` (default) or `scheduler: sge`.
@@ -266,7 +313,9 @@ registering it in `schedulers/__init__.py`.
   (DependencyNeverSatisfied, PartitionTimeLimit, QOSMax*PerJob*, held, SGE Eqw … see
   config.example.yaml) get an alert at the top and no start estimate.
 - **Waiting on dependencies**: in "mine" counts, jobs waiting on dependencies aren't counted
-  as pending; they're shown in brackets after running, e.g. `2 (+5) / 98`.
+  as pending; they're shown in brackets, split by the head of their dependency chain: after
+  running if it is running (they're next), after pending if it is still queued, e.g.
+  `4 (+8) / 417 (+384)`.
 - **More files**: add patterns to `inspect_files`, e.g. `OSZICAR`, `slurm-{id}.out`.
 - **Dependency history incomplete**: increase `history_hours` (sacct range); too large
   makes each refresh slower.
@@ -366,9 +415,11 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
 
 模型：scikit-learn HistGradientBoosting，分位数损失（q20 / q50 / q80），每个集群一组（数据太少的
 集群用全局模型），QoS / 分区是特征。输入：申请的资源，以及 job **可以排队那一刻**的状态（QoS 和
-分区的运行 / 排队数、积压估计、Slurm 的估计和原因、已经排了多久、有没有 / 等了多久依赖）。
-等待一律从 eligible 算起。一起交的一批 job 只算一份，越旧的数据权重越小
-（`wait_model_half_life_days`）。每次训练都会按时间回测，和"历史分位数"比，哪个集群历史分位数
+分区的运行 / 排队数、积压估计、Slurm 的估计和原因、已经排了多久、有没有 / 等了多久依赖），
+你最近的用量（按 7 天半衰期衰减的核时，从 waitlog 里你自己的 job 算出来：fairshare 就是看它）、
+正在跑的核数、几点 / 星期几。等待一律从 eligible 算起。一起交的一批 job 只算一份，越旧的数据权重越小
+（`wait_model_half_life_days`）。每次训练都会按天滚动回测（最近 21 天，每天用之前的数据重训、
+预测当天的 job；4 核约 35 秒），和"历史分位数"比，哪个集群历史分位数
 更准就用它；回测表在页面上能看到。历史数据不到 3 批的预测显示成灰色（"数据少"）。
 刷新越频繁（`auto_refresh_minutes: 15`），数据越好。`python predictor.py` 训练并打印回测（不保存）。
 
@@ -384,6 +435,15 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
 
 ### 界面说明
 
+**默认看图，要数字点“详细数据”。**QoS 卡片、排队预测、Jobs、排队历史这几块默认显示图表，
+标题旁的**详细数据**按钮切回表格（每个浏览器各自记住）。鼠标停在图上能看到具体数字。
+- QoS 卡片：每个分区的节点占用（在用 / 空闲 / 宕机）、你的 job 数和预计等待；能看到别人 job 的
+  Slurm 集群还有**排位**：你排队的 job 在队伍里的位置，下面是别人 job 的优先级分布。
+- 排队预测：网页当时给每个 job 的预测 vs 它实际等了多久。
+- Jobs：时间线，每个名字分组一行：在跑的（淡色 = 到时限还剩）、排队的预计开始区间；点一行跳到表格。
+- 排队历史：共用一根时间轴：我的 job 数（在跑 / 排队）、我的用量（按半衰期衰减，fairshare 看的就是它）、
+  我的 job 排队时的优先级、实际等待（`/api/trends`）。
+
 **QoS / 分区 / 积压**（每个集群一张卡片，树状：QoS → 它能用的分区）
 - Slurm 里**分区** = 一批节点（job 在哪跑），**QoS** = 一套规则（每人上限、最长时间、
   优先级）。每个 job 选一个 QoS 加一个或几个分区，两者是多对多，不是包含关系。每个 QoS
@@ -395,16 +455,24 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
   MaxWall、sacctmgr 里的每人限额（MaxJobs / MaxSubmit / MaxTRES）；运行数或提交数到顶
   会标"运行已满"/"提交已满"
 - 分区行（点 QoS 前面的 ▶）：这个 QoS 在这个分区的 我的 / 全集群，节点和 CPU 的
-  已用 / 空闲 / 总数（`sinfo`；不让用 sinfo 的集群只有 `scontrol` 给的总数），CPU / GPU
-  积压，时限，以及分区自己的 QoS 和限额（比如 sulis 的 `part_compute`，对这个分区里所有
-  job 生效）
+  已用 / 空闲 / 总数（`sinfo`；不让用 sinfo 的集群只有 `scontrol` 给的总数），预计等待，
+  时限，以及分区自己的 QoS 和限额（比如 sulis 的 `part_compute`，对这个分区里所有 job 生效）
+- 预计等待：粗体 = 模型对"你现在交一个典型 job"的中位数，小字 = q20–q80，"≤ X" = 积压
+  估计，当上界看（鼠标停上去看 CPU / GPU 的 Local – Global）
 - 积压 = 把分区里所有 job 的（剩余时长 × 核数/卡数）加起来 ÷ 总核数/卡数，即"完美排满
-  时清空现有的活要多久"；范围 Local – Global（只算本分区 – 算上共享同一批节点的分区）。
+  时清空现有的活要多久"；范围 Local – Global（只算本分区 – 算上共享同一批节点的分区）。实际基本是上界：
+  young / sulis 上 50 批 job 的实际等待都没超过它的 36%。
   表格下面是 GPU 池和"插队"（比你在同分区最早排队的 job 晚提交、却已经在跑的别人的 job，
   通常靠 backfill）。看不到其他用户 job 的集群（bluebear）没法估计，卡片底部会写一行说明
 - 点 QoS 行 = 下面的 job 表只看这个 QoS，点分区行 = 只看这个分区（点 "Jobs" 旁边的标签
   取消）。排队时写了好几个分区的 job 每个分区都算一次。QoS 列表默认自动查（sacctmgr
   assoc），也可以在 config.yaml 里每个集群下面写 `qos:` 手动指定，还能加备注
+
+**上次刷新以来结束**（Job 表上面）
+- 每个集群上一次成功刷新到这一次之间结束的 job，成功、失败、取消、超时都算，带退出码
+  （`sacct` 的 ExitCode / SGE 的 exit_status）。有问题的排在前面，点一行跳到下面 Job 表。
+  状态筛选里也有对应的"上次刷新以来结束"。上次还在跑、这次队列和历史记录里都找不到的
+  显示成"不见了"
 
 **Job 表格**
 - 同一个集群里**名字相同**的 job（一般就是一条 dependency 链，或者同一批重复提交）
@@ -442,6 +510,16 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
     `loop_warn_ratio`、`loop_warn_extra_seconds`、`loop_warn_real_seconds`
   - 点 job id 跳过去，点路径复制
 
+### 给 Claude / curl 看的纯文本（8786 端口）
+和网页同一份数据，输出成对齐的纯文本，监听 `text_port`（默认 8786，`0` = 不开；网页端口下的
+`/text/...` 也一样）。`allow_from` 同样生效。接口见上面英文部分的例子，或者
+`curl -s localhost:8786/help`。常用：`/` 总览、`/jobs?state=failed`、`/job/集群/id?read=1`、
+`/done`、`/qos`、`/fairshare`、`/suggest?cpus=64&time_h=24`、`POST /refresh`（刷新完再返回总览）。
+job 列表最后一列 `dir` 是工作目录（分组的显示代表 job 的目录）。Slurm 排队中的 job 显示 `#N/M @分区`，
+意思是在这个分区参与排序的排队 job 里排第几。数据来自 sprio；等依赖的、被 hold 的不算，backfill 仍可能让小 job 插队。
+`/fairshare` 用几行说明：你的 fairshare 和其他有排队 job 的用户比怎么样，用了自己份额的几倍，
+优先级主要由哪一项决定。只能看到自己 job 的集群（比如 bluebear）没有排位；SGE 没有这项。
+
 ### 调度系统（Slurm / SGE）
 
 `config.yaml` 里每个集群可以写 `scheduler: slurm`（默认）或 `scheduler: sge`。
@@ -473,7 +551,8 @@ Slurm 自己的预计开始时间、原因、优先级）和最终等了多久�
 - **"不会开始"告警**：排队原因匹配 `never_run_reasons` 的 job（DependencyNeverSatisfied、
   PartitionTimeLimit、QOSMax*PerJob*、被 hold、SGE 的 Eqw……见 config.example.yaml）在页面顶上告警，
   也不给它预测开始时间。
-- **等依赖的 job**："我的"数字里不算排队，放在运行数后面的括号里，比如 `2 (+5) / 98`。
+- **等依赖的 job**："我的"数字里不算排队，放在括号里，按依赖链最前面那个 job 分两边：它在跑
+  就放运行数后面（跑完就轮到），它还在排队就放排队数后面，比如 `4 (+8) / 417 (+384)`。
 - **想多看几个文件**：在 `inspect_files` 里加模式，比如 `OSZICAR`、`slurm-{id}.out`。
 - **依赖链历史看不全**：加大 `history_hours`（sacct 查询范围），但太大会让每次
   刷新变慢。

@@ -33,6 +33,7 @@ ACCT = {"qname": 0, "hostname": 1, "owner": 3, "job_name": 4, "job_number": 5,
 class SGE(Scheduler):
     kind = "sge"
     qos_label = "Project"
+    HISTORY_SECTION = "HIST"
     FEATURES = frozenset({"history", "cluster_load"})
 
     def steps(self, want):
@@ -308,5 +309,6 @@ def parse_accounting(lines, cluster_name):
             "deps": [],
             "source": "accounting",
             "exit_status": rec["exit_status"],
+            "exit_code": rec["exit_status"],
         }
     return jobs

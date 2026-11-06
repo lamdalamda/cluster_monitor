@@ -28,7 +28,7 @@ QoS / 分区是模型里的分类特征（单独给每个队列训练数据太�
 可以排队的时间 = 前置 job 预计结束（在跑的：开始 + 时限；在排的：递归它的预计开始 + 时限），
 所以是偏保守的上限。
 
-评估：按时间滚动回测（最早 50% 起步，每次往后预测 12.5%），和 baseline 比：
+评估：按天滚动回测（最近 21 天，每天用之前的数据重训、预测当天开始的 job），和 baseline 比：
 同集群同 QoS 历史中位数，以及（有的话）Slurm 自己的估计、积压估计。结果存在模型里，网页上能看到。
 
 scikit-learn 是可选依赖：没装的话页面上的预测功能显示"需要安装 scikit-learn"。
@@ -45,6 +45,7 @@ import time
 from datetime import datetime
 
 import backlog
+import waitlog
 from i18n import L
 from schedulers.base import ACTIVE, PENDING, waiting_on_dependency
 
@@ -53,7 +54,7 @@ FLOOR_H = 1 / 60  # log 变换的下限：1 分钟
 MIN_TRAIN_ROWS = 50  # 已经开始的 job 少于这么多就不训练
 MIN_CLUSTER_STARTED = 30  # 少于这么多的集群用全局模型
 FEW_SEEN = 3  # 历史上在这个 QoS + 分区开始过的 job 少于这么多批：标"数据少"（建议里排后面）
-TRAIN_THREADS = 2
+TRAIN_THREADS = 4  # 训练 + 滚动回测几十秒（2026-11：~4600 条）
 HISTORY_KEEP = 30  # 训练记录保留几条（看模型是不是越来越准）
 GB_PARAMS = dict(max_iter=40, learning_rate=0.1, max_depth=3, l2_regularization=5.0)
 LEAF_FRACTION = 25  # 每片叶子至少 样本数/25 个样本（至少 8 个）：数据少的集群也能分叉，又不会背下单个批次
@@ -65,6 +66,10 @@ NUM_FEATURES = [
     "part_all_running", "part_all_pending",
     "bl_cpu_min_h", "bl_cpu_max_h", "bl_gpu_min_h", "bl_gpu_max_h",
     "slurm_remaining_h",
+    # fairshare 的来源：我最近的用量（按 7 天半衰期衰减的核时）和正在跑的核数；什么时候交（几点、星期几）。
+    # 回测（按天滚动）里这几个让分位数损失从 0.80 降到 0.72，sulis / old 最明显。
+    # 直接用 job 的优先级反而没用：fairshare 一掉，优先级就落到训练时没见过的范围，树模型外推不了
+    "my_usage_cpuh", "my_running_cpus", "hour", "weekday",
 ]
 CAT_FEATURES = ["cluster", "qos", "partition", "reason"]
 FEATURES = NUM_FEATURES + CAT_FEATURES
@@ -185,7 +190,7 @@ class Snapshots:
         return f
 
 
-def row_to_sample(row, snaps):
+def row_to_sample(row, snaps, runs=None, from_eligible=False):
     """jobs.csv 的一行 -> (features dict, target 小时, censored, 时间) 或 None
 
     一律从 eligible（dependency 满足、真正开始排队）算起：带 dependency 的 job，
@@ -193,7 +198,10 @@ def row_to_sample(row, snaps):
     - 第一次看到它排队是在 eligible 之后（不是在等 dependency）：用当时记下的状态（obs_*），
       目标 = 从那一刻起还要等多久，已等时间也是特征
     - 否则（开得太快没看到 / 看到时还在等 dependency）：用 eligible 那一刻前后的快照，已等 0
-    - 带 dependency 但还没有 eligible（还在等前置 job，或者等的时候被取消了）：不算"""
+    - 带 dependency 但还没有 eligible（还在等前置 job，或者等的时候被取消了）：不算
+    runs：waitlog.usage_runs(全部行)，算"那一刻我的用量"
+    from_eligible=True：不管有没有看到它排队，都按"刚可以排队"算（快照里的状态、已等 0），
+    给看到过排队的 job 再加一个样本用（见 train()）"""
     if row.get("dependency") and not row.get("eligible"):
         return None
     eligible = parse_ts(row.get("eligible") or row.get("submit"))
@@ -204,7 +212,7 @@ def row_to_sample(row, snaps):
     censored = row.get("censored") == "1"
     obs_at = parse_ts(row.get("obs_at")) if row.get("seen_pending") == "1" else None
     reason = norm_reason(row.get("obs_reason"))
-    use_obs = obs_at is not None and obs_at >= eligible and reason != "Dependency"
+    use_obs = not from_eligible and obs_at is not None and obs_at >= eligible and reason != "Dependency"
     waited = (obs_at - eligible).total_seconds() / 3600 if use_obs else 0.0
     target = total - waited
     if target < 0:
@@ -227,6 +235,9 @@ def row_to_sample(row, snaps):
         "dep_wait_h": max((eligible - submit).total_seconds() / 3600, 0)
                       if row.get("dependency") and submit else 0.0,
     }
+    if runs is not None:
+        f["my_usage_cpuh"], f["my_running_cpus"] = waitlog.decayed_usage(runs.get(f["cluster"], []), when.timestamp())
+    f["hour"], f["weekday"] = when.hour + when.minute / 60, float(when.weekday())
     if use_obs:
         est = parse_ts(row.get("obs_slurm_est_start"))
         f.update({
@@ -430,18 +441,23 @@ def score(pred, actual, w, lo=None, hi=None):
     return out
 
 
-def backtest(samples, target, censored, times, half_life_days, folds=4):
-    """最早 50% 起步，每次多用 12.5% 训练、预测接下来 12.5% 里已经开始的 job。
+def backtest(samples, target, censored, times, half_life_days, days=21, step_h=24):
+    """按天滚动：从数据时间跨度的一半（最多往前 days 天）起，每天用之前的所有数据训练，
+    预测这一天里（eligible / 第一次看到它排队）后来开始了的 job。按行数切的话，一大批一起交的 job
+    会挤在同一折里，测试集只剩几批，"模型 vs 历史分位数"基本是噪声。
     比较：模型 / 历史分位数（同 QoS + 分区）/ Slurm 自己的估计 / 积压估计（后两个有的话）"""
     import numpy as np
     order = np.argsort(times)
     n = len(order)
     bw = sample_weights(samples, times, 0)
+    t_end = float(times.max())
+    t = max(float(times[order[n // 2]]), t_end - days * 86400)
+    t_from = t
     idx, PM, PH = [], [], []
-    for k in range(folds):
-        a, b = int(n * (0.5 + 0.5 * k / folds)), int(n * (0.5 + 0.5 * (k + 1) / folds))
-        tr, te = order[:a], order[a:b]
-        te = te[~censored[te]]
+    while t < t_end:
+        tr = np.flatnonzero(times < t)
+        te = np.flatnonzero((times >= t) & (times < t + step_h * 3600) & ~censored)
+        t += step_h * 3600
         if (~censored[tr]).sum() < MIN_TRAIN_ROWS or not len(te):
             continue
         model = WaitModel([samples[i] for i in tr], target[tr], censored[tr], times[tr], half_life_days)
@@ -468,7 +484,7 @@ def backtest(samples, target, censored, times, half_life_days, folds=4):
 
     return {"all": block(np.ones(len(idx), bool)),
             "clusters": {c: block(cl == c) for c in sorted(set(cl))},
-            "from": datetime.fromtimestamp(times[order[n // 2]]).strftime("%Y-%m-%d")}
+            "from": datetime.fromtimestamp(t_from).strftime("%Y-%m-%d")}
 
 
 # ---------------- 训练 + 存取 ----------------
@@ -480,11 +496,25 @@ def train(rows, snaps=None, half_life_days=14, now=None):
     now = now or datetime.now()
     t0 = time.time()
     samples, target, censored, times = [], [], [], []
+    runs = waitlog.usage_runs(rows)
+    n_rows = 0
     for r in rows:
-        s = row_to_sample(r, snaps)
-        if s:
-            samples.append(s[0]); target.append(s[1]); censored.append(s[2])
-            times.append(s[3].timestamp())
+        s = row_to_sample(r, snaps, runs)
+        if not s:
+            continue
+        n_rows += 1
+        ss = [s]
+        # 看到过排队的 job 再加一个"从 eligible 起算"的样本。不加的话，"原因为空、已等 0"的样本
+        # 只剩开得太快、没来得及看到排队的 job，新 job（"交到哪里最快"）的预测会偏短很多：
+        # 按天滚动回测里中位数只有实际的 1/10，加了以后 1/2.3，分位数损失 0.83 → 0.78
+        if "slurm_remaining_h" in s[0]:
+            e = row_to_sample(r, snaps, runs, from_eligible=True)
+            if e:
+                e[0]["_extra"] = True
+                ss.append(e)
+        for x in ss:
+            samples.append(x[0]); target.append(x[1]); censored.append(x[2])
+            times.append(x[3].timestamp())
     if sum(1 for c in censored if not c) < MIN_TRAIN_ROWS:
         raise ValueError(L(f"数据太少：只有 {len(samples)} 条可用记录（已经开始的至少要 {MIN_TRAIN_ROWS} 条）",
                            f"Not enough data: {len(samples)} usable rows (need {MIN_TRAIN_ROWS} started jobs)"))
@@ -499,12 +529,16 @@ def train(rows, snaps=None, half_life_days=14, now=None):
     # 每个 (集群, QoS, 分区) 有多少批已经开始的 job（一起交的算一批）：太少的标"数据少"
     batches, per_cluster = {}, {}
     for s, c, t in zip(samples, censored, times):
+        if s.get("_extra"):
+            continue
         k = f"{s['cluster']}|{s['qos']}|{s['partition']}"
         b = batches.setdefault(k, set())
         if not c:
             b.add((s["cpus"], int(t // 1800)))
     counts = {k: len(v) for k, v in batches.items()}
     for s, c in zip(samples, censored):
+        if s.get("_extra"):
+            continue
         pc = per_cluster.setdefault(s["cluster"], {"samples": 0, "started": 0, "with_state": 0})
         pc["samples"] += 1
         pc["started"] += 0 if c else 1
@@ -513,12 +547,13 @@ def train(rows, snaps=None, half_life_days=14, now=None):
         pc["model"] = model.which(c)
     meta = {
         "trained_at": now.strftime("%Y-%m-%dT%H:%M:%S"),
-        "n_samples": len(samples), "n_started": int((~censored).sum()),
-        "n_censored": int(censored.sum()), "clusters": per_cluster,
+        # 按 job 数（不算上面额外加的"从 eligible 起算"样本）
+        "n_samples": n_rows, "n_started": sum(pc["started"] for pc in per_cluster.values()),
+        "n_censored": n_rows - sum(pc["started"] for pc in per_cluster.values()), "clusters": per_cluster,
         "metrics": metrics, "seconds": round(time.time() - t0, 1),
         "half_life_days": half_life_days, "sklearn": sklearn.__version__,
     }
-    return {"version": 3, "model": model, "counts": counts, "meta": meta}
+    return {"version": 4, "model": model, "counts": counts, "meta": meta}
 
 
 def save(bundle, path, history):
@@ -537,16 +572,21 @@ def save(bundle, path, history):
 def load(path):
     with open(path, "rb") as f:
         bundle = pickle.load(f)
-    if bundle.get("version") != 3:
+    if bundle.get("version") != 4:  # 4：加了用量 / 时间特征，旧模型的特征列对不上
         raise ValueError("old model format")
     return bundle
 
 
 # ---------------- 预测时的特征：用当前刷新结果拼出和训练时一样的东西 ----------------
-def context_of(result):
-    """poll_cluster 的结果 -> 预测要用的集群状态"""
+def context_of(result, runs=None, now=None):
+    """poll_cluster 的结果 -> 预测要用的集群状态。runs：waitlog.usage_runs()，算我现在的用量"""
     bl = result.get("backlog") or {}
+    now = now or datetime.now()
+    usage = waitlog.decayed_usage(runs.get(result["name"], []), now.timestamp())[0] if runs is not None else math.nan
     return {
+        "now": now, "usage": usage,
+        "running_cpus": sum(num(j.get("cpus")) for j in result.get("jobs", {}).values()
+                            if j["state"] in ACTIVE and not math.isnan(num(j.get("cpus")))),
         "cluster": result["name"],
         "qos": {q["name"]: q for q in result.get("qos", [])},
         "bl": {p["name"]: p for p in bl.get("partitions", [])} if bl.get("ok") else {},
@@ -566,6 +606,8 @@ def state_features(ctx, qos, partition, gpus, gpu_type):
         "qos_mine_pending": num(q.get("mine_pending")),
         "part_all_running": num((ctx["parts"].get(partition) or {}).get("all_running")),
         "part_all_pending": num((ctx["parts"].get(partition) or {}).get("all_pending")),
+        "my_usage_cpuh": ctx["usage"], "my_running_cpus": ctx["running_cpus"],
+        "hour": ctx["now"].hour + ctx["now"].minute / 60, "weekday": float(ctx["now"].weekday()),
     }
     p = ctx["bl"].get(partition)
     if p:
@@ -662,6 +704,7 @@ class Predictor:
         self.half_life_days = half_life_days
         self.bundle = None
         self.error = None  # 加载 / 训练出错（给前端看）
+        self.runs = {}  # waitlog.usage_runs()：预测时算"我现在的用量"，Backend 每次写完 waitlog 更新
         self.training = False
         self.lock = threading.Lock()
         try:
@@ -674,6 +717,11 @@ class Predictor:
                 self.bundle = load(path)
             except Exception as e:  # noqa: BLE001  比如 sklearn 版本变了
                 self.error = L(f"模型文件读不了（{e}），请重新训练", f"Cannot load model ({e}); please retrain")
+
+    def set_runs(self, wl):
+        with wl.lock:
+            rows = list(wl.rows.values())
+        self.runs = waitlog.usage_runs(rows)
 
     def status(self):
         return {"available": self.available, "training": self.training, "error": self.error,
@@ -716,7 +764,7 @@ class Predictor:
         if not self.bundle or not result.get("jobs"):
             return
         now = now or datetime.now()
-        ctx = context_of(result)
+        ctx = context_of(result, self.runs, now)
         todo = [(jid, job_samples(j, ctx, now)) for jid, j in jobs.items()
                 if j["state"] in PENDING and j.get("live") and "[" not in jid and not j.get("never_run")]
         if not todo:
@@ -756,7 +804,7 @@ class Predictor:
                 ch.pop("ml", None)
         if not self.bundle or not ov.get("groups"):
             return
-        ctx = context_of(result)
+        ctx = context_of(result, self.runs)
         jobs = result.get("jobs", {})
         items, samples = [], []
         for g in ov["groups"]:
@@ -797,7 +845,7 @@ class Predictor:
             if req.get("cluster") and name != req["cluster"]:
                 continue
             ov = r.get("overview") or {}
-            ctx = context_of(r)
+            ctx = context_of(r, self.runs, now)
             limits = {q["name"]: q for q in r.get("qos", [])}
             groups = ov.get("groups")
             if not groups:  # 旧缓存没有 QoS → 分区的树：用你的 job 里见过的组合

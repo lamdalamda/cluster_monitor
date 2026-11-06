@@ -15,6 +15,7 @@
 """
 
 import csv
+import math
 import os
 import re
 import tarfile
@@ -47,6 +48,11 @@ JOB_COLUMNS = [
     "obs_bl_gpu_max_h", "obs_bl_bottleneck", "obs_bl_age_min",
     # 当时这个分区全集群的运行 / 排队数（所有 QoS）；当时预测模型给的排队时间（以后用来检验模型）
     "obs_part_all_running", "obs_part_all_pending", "obs_ml_q20_h", "obs_ml_q50_h", "obs_ml_q80_h",
+    # 后来加的（Slurm 的 sshare / sprio）：你的 fairshare（几个账户取最低）、有排队 job 的别人里 fairshare
+    # 比你高的比例；这个 job 在最靠前的候选分区排第几 / 一共几个参与排序的、前面几个用户 / 一共几个、
+    # 别人优先级的中位数
+    "obs_fairshare", "obs_fs_higher_frac", "obs_queue_ahead", "obs_queue_competing",
+    "obs_queue_users_ahead", "obs_queue_users", "obs_others_median_prio",
 ]
 QOS_COLUMNS = ["observed_at", "cluster", "qos", "all_running", "all_pending",
                "mine_running", "mine_pending", "max_jobs_pu", "max_submit_pu", "max_wall"]
@@ -165,6 +171,7 @@ class WaitLog:
             bl_at = None
         load_private = result.get("load_private")
         ov_parts = (result.get("overview") or {}).get("partitions", {})
+        fs = result.get("fairshare") or {}
         with self.lock:
             for jid, j in result.get("jobs", {}).items():
                 if "[" in jid:  # 还没展开的 array 排队记录（123_[1-10]），等各个 task 出现再记
@@ -184,6 +191,7 @@ class WaitLog:
                     row["seen_pending"] = "1"
                     self._fill_obs(row, j, now, qos_rows.get(j.get("qos")), bl_parts, bl_at,
                                    load_private, ov_parts)
+                    self._fill_fairshare(row, j, fs)
                 self._fill_outcome(row, j, now_s)
             self._write_jobs()
         self._append(self.qos_path, QOS_COLUMNS, [{
@@ -273,6 +281,23 @@ class WaitLog:
         })
 
     @staticmethod
+    def _fill_fairshare(row, j, fs):
+        vals = [a["fairshare"] for a in fs.get("accounts") or [] if a.get("fairshare") is not None]
+        u = fs.get("users") or {}
+        parts = [(p, x) for p, x in ((j.get("prio") or {}).get("parts") or {}).items()]
+        best = min(parts, key=lambda px: px[1]["ahead"]) if parts and fs.get("sees_others") else None
+        st = (fs.get("partitions") or {}).get(best[0], {}) if best else {}
+        row.update({
+            "obs_fairshare": fmt(min(vals), 6) if vals else "",
+            "obs_fs_higher_frac": fmt(u["higher_fairshare"] / u["with_pending"]) if u.get("with_pending") else "",
+            "obs_queue_ahead": best[1]["ahead"] if best else "",
+            "obs_queue_competing": best[1]["competing"] if best else "",
+            "obs_queue_users_ahead": best[1]["users_ahead"] if best else "",
+            "obs_queue_users": st.get("users", "") if best else "",
+            "obs_others_median_prio": st.get("median", "") if best else "",
+        })
+
+    @staticmethod
     def _fill_outcome(row, j, now_s):
         state = j.get("state", "")
         row["state"] = state
@@ -296,6 +321,60 @@ class WaitLog:
         row["wait_from_submit_h"] = hours_between(row.get("submit"), end_ref)
         row["wait_from_eligible_h"] = hours_between(row.get("eligible") or row.get("submit"),
                                                     end_ref)
+
+    # ---------------- 网页上的趋势图 ----------------
+    def trends(self, days=21, now=None):
+        """每个集群：我的 job 数（每次刷新）、我的用量（每 6 小时）、我排队时的优先级、实际等待、
+        预测 vs 实际（网页当时显示的模型中位数）。时间都是本机 / 集群本地时间字符串"""
+        now = now or datetime.now()
+        since = now - timedelta(days=days)
+        with self.lock:
+            rows = [dict(r) for r in self.rows.values()]
+        out = {}
+
+        def c_of(name):
+            return out.setdefault(name, {"jobs": [], "usage": [], "prio": [], "waits": [], "calib": []})
+        try:
+            with open(self.qos_path, newline="", encoding="utf-8") as f:
+                agg = {}
+                for r in csv.DictReader(f):
+                    t = parse_ts(r.get("observed_at"))
+                    if not t or t < since:
+                        continue
+                    a = agg.setdefault((r["cluster"], r["observed_at"]), [0, 0])
+                    a[0] += int(to_float(r.get("mine_running")) or 0)
+                    a[1] += int(to_float(r.get("mine_pending")) or 0)
+            for (c, t), (run, pend) in sorted(agg.items(), key=lambda kv: kv[0][1]):
+                c_of(c)["jobs"].append([t, run, pend])
+        except OSError:
+            pass
+        runs = usage_runs(rows)
+        grid = [since + timedelta(hours=6 * k) for k in range(int(days * 4) + 1)] + [now]
+        for c, rs in runs.items():
+            c_of(c)["usage"] = [[t.strftime("%Y-%m-%dT%H:%M:%S"), round(decayed_usage(rs, t.timestamp())[0], 1)]
+                                for t in grid if t <= now]
+        for r in rows:
+            c = r.get("cluster", "")
+            obs = parse_ts(r.get("obs_at"))
+            dep = waiting_dep(r.get("obs_reason"))
+            if obs and obs >= since and not dep and to_float(r.get("obs_priority")) is not None:
+                c_of(c)["prio"].append([r["obs_at"], to_float(r["obs_priority"])])
+            el = parse_ts(r.get("eligible") or r.get("submit"))
+            w = to_float(r.get("wait_from_eligible_h"))
+            if r.get("censored") == "0" and el and el >= since and w is not None:
+                c_of(c)["waits"].append([el.strftime("%Y-%m-%dT%H:%M:%S"), round(max(w, 0), 3), r.get("jobid")])
+            pred = to_float(r.get("obs_ml_q50_h"))
+            start = parse_ts(r.get("start"))
+            if pred is not None and obs and start and obs >= since and not dep and r.get("censored") == "0":
+                # 最后一项：批次（一起交的一批 job 预测和结果几乎一样，按批算才不会被一大批左右）
+                c_of(c)["calib"].append([round(pred, 3), round(max((start - obs).total_seconds() / 3600, 0), 3),
+                                         r.get("jobid"), f"{r.get('qos')}|{r.get('partition')}|{r.get('cpus')}|"
+                                                         f"{int(obs.timestamp() // 1800)}"])
+        for v in out.values():
+            v["prio"].sort()
+            v["waits"].sort()
+        return {"now": now.strftime("%Y-%m-%dT%H:%M:%S"), "since": since.strftime("%Y-%m-%dT%H:%M:%S"),
+                "usage_half_days": USAGE_HALF_DAYS, "clusters": out}
 
     # ---------------- 网页上的"排队历史" ----------------
     def history(self, days=None, cluster="", qos="", search="", limit=300, now=None):
@@ -356,6 +435,39 @@ class WaitLog:
             "censored": r.get("censored") != "0",
         } for r in jobs[:limit]]
         return {"stats": stats, "jobs": out, "total": len(jobs)}
+
+
+# ---------------- 我的用量（fairshare 的来源）：网页的趋势图和预测模型共用 ----------------
+USAGE_HALF_DAYS = 7  # young 的 PriorityDecayHalfLife 是 7 天（bluebear 10 天），统一按 7 天算
+
+
+def usage_runs(rows):
+    """jobs.csv 的行 -> {集群: [(开始, 结束, 核数)]}（时间戳，按开始排好）；还在跑的结束 = 最后一次看到"""
+    runs = {}
+    for r in rows:
+        s = parse_ts(r.get("start"))
+        cpus = to_float(r.get("cpus"))
+        if not s or not cpus:
+            continue
+        e = parse_ts(r.get("end")) or parse_ts(r.get("last_seen_at")) or s
+        runs.setdefault(r.get("cluster", ""), []).append((s.timestamp(), max(e, s).timestamp(), cpus))
+    for v in runs.values():
+        v.sort()
+    return runs
+
+
+def decayed_usage(runs, t, half_days=USAGE_HALF_DAYS):
+    """t 时刻：(按半衰期衰减的累计用量 CPU 小时, 正在跑的核数)，和 Slurm 算 fairshare 用的一样"""
+    H = half_days * 86400
+    tot = now = 0.0
+    for s, e, c in runs:
+        if s >= t:
+            break
+        ee = min(e, t)
+        tot += c * H / math.log(2) * (2 ** (-(t - ee) / H) - 2 ** (-(t - s) / H)) / 3600
+        if e > t:
+            now += c
+    return tot, now
 
 
 def waiting_dep(reason):

@@ -9,6 +9,8 @@
     --bg:#0f1117; --panel:#161922; --panel2:#1b1f2a; --border:#2a2e3a; --text:#e6e8ee; --muted:#8b90a0;
     --accent:#5b8def; --row-hover:#1e2330; --child:#12151d;
     --ok:#2ecc71; --warn:#f1c40f; --bad:#e74c3c;
+    /* 图表：分类色（色盲校验过，暗色背景）+ 别人 / 宕机的灰 */
+    --c1:#3987e5; --c2:#d95926; --c3:#199e70; --c-other:#3a4052; --c-down:#4a5063; --c-grid:#232733;
   }
   *{box-sizing:border-box;}
   body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);font-size:13px;}
@@ -72,6 +74,8 @@
   .open .tri{transform:rotate(90deg);}
   td.name{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;max-width:420px;overflow:hidden;text-overflow:ellipsis;}
   .count{color:var(--muted);font-family:inherit;font-size:11px;margin-left:6px;}
+  #doneWrap tbody tr{cursor:pointer;}
+  #doneSince{font-size:12px;margin:-4px 0 6px;}
   td.jid{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;cursor:copy;}
   td.jid:hover{color:var(--accent);}
   td.part{max-width:180px;overflow:hidden;text-overflow:ellipsis;color:var(--muted);}
@@ -98,8 +102,6 @@
   .qos td.limits{white-space:normal;color:var(--muted);font-size:12px;min-width:150px;}
   .qos td.limits b{font-weight:500;color:var(--text);}
   .h-ok{color:var(--ok);} .h-mid{color:var(--warn);} .h-bad{color:#ff7b6b;}
-  .gpuv{margin-right:10px;white-space:nowrap;}
-  .gpuv .t{color:var(--muted);font-size:11px;}
   .card-foot{padding:7px 12px;font-size:12px;color:var(--muted);border-top:1px solid var(--border);}
   .card-foot b{color:var(--text);font-weight:500;}
   details.cut{border-top:1px solid var(--border);}
@@ -174,6 +176,25 @@
   .dep-n{color:#b39ddb;}
   .tag.fast{background:#1d3324;color:var(--ok);}
   .qos .rng{color:var(--muted);font-size:11px;margin-left:4px;}
+  .qos .ub{color:var(--muted);font-size:11px;margin-left:6px;white-space:nowrap;}
+  .rank{font-size:11px;margin-left:4px;white-space:nowrap;cursor:help;}
+  /* 图表 */
+  .viewBtn{font-size:12px;padding:2px 9px;}
+  .viz{padding:8px 12px 10px;}
+  .viz svg{display:block;overflow:visible;}
+  .viz svg text{font-family:inherit;font-size:11px;fill:var(--muted);}
+  .viz svg text.lab{fill:var(--text);}
+  .viz svg [data-tip]{cursor:default;}
+  .viz svg [data-jump]{cursor:pointer;}
+  .viz svg .row:hover rect.hl{fill:var(--row-hover);}
+  .viz .sub{font-size:12px;color:var(--muted);margin:8px 0 2px;}
+  .viz .legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;color:var(--muted);margin:2px 0 6px;}
+  .viz .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px;}
+  .viz .legend i.line{height:2px;width:12px;vertical-align:3px;}
+  .viz .empty{padding:14px 0;}
+  .viz .small-multiples{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px 18px;}
+  #vizTip{position:fixed;pointer-events:none;background:var(--panel2);border:1px solid var(--border);border-radius:6px;
+    padding:6px 9px;font-size:12px;white-space:pre;z-index:50;display:none;box-shadow:0 2px 10px #0009;color:var(--text);}
   #recBanner{margin:0 0 12px;padding:9px 14px;border:1px solid #2c5a3a;background:#14261b;border-radius:8px;font-size:14px;}
   #recBanner:empty{display:none;}
   #recBanner b{color:var(--ok);}
@@ -205,6 +226,7 @@
     <option value="running" data-i18n="f_running"></option>
     <option value="pending" data-i18n="f_pending"></option>
     <option value="dep" data-i18n="f_dep"></option>
+    <option value="just_done" data-i18n="f_just_done"></option>
     <option value="done" data-i18n="f_done"></option>
     <option value="failed" data-i18n="f_failed"></option>
   </select>
@@ -223,13 +245,13 @@
   <div id="errors"></div>
   <div id="recBanner"></div>
 
-  <h2><span data-i18n="ov_title"></span> <button id="ovToggle"></button>
+  <h2><span data-i18n="ov_title"></span> <button id="ovToggle"></button><button class="viewBtn" data-view="ov"></button>
     <span class="muted" data-i18n="ov_hint"></span></h2>
   <details class="how"><summary data-i18n="ov_how"></summary><div data-i18n-html="ov_how_body"></div></details>
   <details class="how"><summary data-i18n="bl_how"></summary><div data-i18n-html="bl_how_body"></div></details>
   <div id="ovGrid"></div>
 
-  <h2 id="mlH"><span data-i18n="ml_title"></span> <button id="mlToggle"></button>
+  <h2 id="mlH"><span data-i18n="ml_title"></span> <button id="mlToggle"></button><button class="viewBtn" data-view="ml"></button>
     <button id="mlTrain"></button> <span class="muted" data-i18n="ml_hint"></span></h2>
   <div id="mlWrap">
     <details class="how"><summary data-i18n="ml_how"></summary><div data-i18n-html="ml_how_body"></div></details>
@@ -247,10 +269,18 @@
     <div id="mlResult" class="tablewrap"></div>
   </div>
 
-  <h2>Jobs <button id="expandAll" data-i18n="expand_all"></button><button id="collapseAll" data-i18n="collapse_all"></button>
+  <div id="doneSec">
+    <h2><span data-i18n="done_title"></span> <button id="doneToggle"></button>
+      <span id="doneCounts"></span></h2>
+    <div class="muted" id="doneSince"></div>
+    <div id="doneWrap" class="tablewrap"></div>
+  </div>
+
+  <h2>Jobs <button class="viewBtn" data-view="jobs"></button><button id="expandAll" data-i18n="expand_all"></button><button id="collapseAll" data-i18n="collapse_all"></button>
     <span class="tag cfg" id="partChip" style="display:none"></span>
     <span class="muted" data-i18n="jobs_hint"></span></h2>
-  <div class="tablewrap">
+  <div id="ganttWrap" class="tablewrap viz"></div>
+  <div class="tablewrap" id="jobsTableWrap">
     <table id="jobs">
       <thead><tr>
         <th></th><th data-i18n="col_name"></th><th data-i18n="col_cluster"></th><th>Job ID</th><th data-i18n="col_state"></th>
@@ -261,7 +291,7 @@
     </table>
   </div>
 
-  <h2 id="histH"><span data-i18n="hist_title"></span> <button id="histToggle"></button>
+  <h2 id="histH"><span data-i18n="hist_title"></span> <button id="histToggle"></button><button class="viewBtn" data-view="hist"></button>
     <span class="muted" data-i18n="hist_hint"></span></h2>
   <div id="histWrap">
     <div class="hist-ctl">
@@ -276,11 +306,13 @@
       <input type="text" id="histSearch" data-i18n-ph="hist_search_ph">
       <span class="muted" id="histBackup"></span>
     </div>
+    <div id="histChart" class="card viz"></div>
     <div id="histStats" class="card"></div>
     <div id="histJobs" class="tablewrap"></div>
   </div>
 </main>
 <div id="toast"></div>
+<div id="vizTip"></div>
 
 <script>
 // ---------------- 中英文 ----------------
@@ -291,13 +323,14 @@ const I18N = {
     updated_at: s => "数据更新于 " + s,
     all_clusters: "所有集群", all_qos: "所有 QoS",
     f_all_states: "全部状态", f_active: "活跃（运行+排队）", f_running: "运行中", f_pending: "排队中（不含等依赖）",
-    f_dep: "等依赖", f_done: "已结束", f_failed: "最近一个失败/取消",
+    f_dep: "等依赖", f_just_done: "上次刷新以来结束", f_done: "已结束", f_failed: "最近一个失败/取消",
     search_ph: "搜索 job id / 名字 / 节点 / QoS",
     refresh: "立即刷新", refreshing: "刷新中…", queued_btn: "已加入队列",
     collapse: "收起", expand: "展开", expand_all: "全部展开", collapse_all: "全部收起", show_all: "显示全部",
     bl_title: "积压", bl_how: "排队积压怎么算的（每个分区现在的活要多久才能消化完，每几分钟更新一次）",
     bl_how_body: `把分区里所有 job 的（剩余时长 × 核数）加起来，除以分区总核数，就是"假设完美排满、把现有的活清空要多久"；GPU 同理按卡算。<br>
-      范围的前一个数（Local）只算这个分区自己；后一个数（Global）把共享同一批节点的分区都算上（比如 gpu / gpulowpri / gpu-devel 共用一批卡）。真实等待一般落在中间。<br>
+      范围的前一个数（Local）只算这个分区自己；后一个数（Global）把共享同一批节点的分区都算上（比如 gpu / gpulowpri / gpu-devel 共用一批卡）。<br>
+      实际上它基本是<b>上界</b>：job 大多提前跑完、排在你后面的也算进去了、backfill 能插空。young / sulis 上 50 批 job 的实际等待都没超过它的 36%，所以分区表里显示成"≤"，和模型的预测放在同一列。<br>
       下面 Job 表里你排队的 job 会显示"积压"：取 CPU / GPU 里最慢的那个（瓶颈），多个候选分区取最快的那个。这只是粗略参考：没算优先级、fairshare 和 backfill。<br>
       "插队"= 和你同分区、比你最早排队的 job 晚提交、却已经在跑的别人的 job，通常是靠 backfill（时间短 / 资源少）插进去的。`,
     jobs_hint: "同集群、同名字的 job 收在一行里 · 展开后会读取每个 job 的工作目录 · 点 Job ID / 路径复制",
@@ -323,8 +356,9 @@ const I18N = {
     load_private_tip: "这个集群的 squeue 只能看到你自己的 job（PrivateData），没法统计全集群",
     load_tip: "所有用户在这个 QoS 上 运行 / 排队 的 job 数", load_off_tip: "这个集群没有开全集群统计（disable: [cluster_load]）",
     sub_full: "提交已满", run_full: "运行已满", hidden: "隐藏",
-    mine_summary: (r, p, d) => `我的：<span class="n-r">${r}</span> 运行${d ? `（<span class="dep-n" title="${esc(t("dep_tip"))}">+${d}</span> 等依赖）` : ""} · <span class="n-pd">${p}</span> 排队`,
-    dep_tip: "括号里是等依赖的 job：前置 job 结束才会开始，不算在排队",
+    mine_summary: (r, p, dr, dq) => `我的：<span class="n-r">${r}</span> 运行${dr ? `（<span class="dep-n" title="${esc(t("dep_tip_run"))}">+${dr}</span> 等依赖）` : ""} · <span class="n-pd">${p}</span> 排队${dq ? `（<span class="dep-n" title="${esc(t("dep_tip_queue"))}">+${dq}</span> 等依赖）` : ""}`,
+    dep_tip_run: "等依赖的 job，前置 job 正在跑：跑完就轮到它们（不算在排队）",
+    dep_tip_queue: "等依赖的 job，前置 job（或者依赖链最前面的那个）还在排队：要等它排到、跑完才会开始（不算在排队）",
     data_at: s => `${s} 的数据`,
     th_mine: "我的", th_all: "全集群",
     th_maxjobs_tip: "每人最多同时运行的 job 数 (MaxJobsPU)", th_maxsubmit_tip: "每人最多提交的 job 数 (MaxSubmitPU)",
@@ -334,8 +368,7 @@ const I18N = {
     gpu_pool: "GPU 池：", pool_item: (t, n, ps) => `<b>${t}</b> ${n} 卡（${ps} 共用）`,
     cutters: (n, k) => `插队：${n} 个比你晚提交的 job 已经在跑${k ? `（显示最新 ${k} 个）` : ""}`,
     th_account: "账户", th_res: "资源", th_limit: "申请时长", th_reason: "推测原因",
-    th_cpus: "总核数", th_gpus: "总卡数", th_cpu_bl: "CPU 积压", th_gpu_bl: "GPU 积压",
-    bl_range_tip: "Local（只算本分区） – Global（算上共享节点的分区）",
+    th_cpus: "总核数", th_gpus: "总卡数",
     alerts: n => `提醒 ${n}`, al_same_dir: "同目录同时运行",
     al_same_dir_msg: n => `${n} 个 job 在同一个目录里跑（dependency 可能没设对）：`, al_stale: "（旧数据）",
     al_big_dir: "目录过大", al_many_files: "文件过多", n_entries: n => `${n} 个文件`,
@@ -371,6 +404,10 @@ const I18N = {
     part_no_info: c => c.scheduler === "sge" ? "SGE 没有分区信息，只按你的 job 的并行环境（PE）统计" : "这个集群看不到 sinfo（没权限），只统计你自己的 job",
     part_chip: p => `分区：${p} ✕`,
     al_waitlog_full_msg: (s, l) => `${s} MB > ${l} MB，已停止写入等待时间数据。清理或归档这个文件夹，或调大 config.yaml 里的 waitlog_max_mb：`,
+    done_title: "上次刷新以来结束", done_none: "两次刷新之间没有 job 结束",
+    done_since: (a, b) => `${a} → ${b}`, done_exit: "退出码", done_end: "结束", done_ran: "跑了",
+    done_gone: "不见了", done_gone_tip: "上次还在跑/排队，这次队列和历史记录里都找不到了（超出了历史记录的时间范围，或者 SGE 的记录还没写进 accounting）",
+    done_hint: "成功、失败、取消都算 · 每个集群和它自己上一次成功刷新比 · 点一行跳到下面 Jobs 表",
     hist_title: "排队历史", hist_hint: "来自 waitlog/jobs.csv · 等待 = 开始 − 可以开始排队（依赖满足）的时间 · 点统计表一行筛选下面的 job",
     hist_d7: "最近 7 天", hist_d30: "最近 30 天", hist_d90: "最近 90 天", hist_d365: "最近一年", hist_dall: "全部",
     hist_search_ph: "搜索 job id / 名字 / 节点 / 分区",
@@ -388,7 +425,7 @@ const I18N = {
     ml_title: "排队预测", ml_hint: "用 waitlog 里攒下的数据训练的小模型：排队 job 的开始时间（Jobs 表“时间”列紫色的“模型”）+ 新 job 交到哪里最快",
     ml_how: "怎么算的？准不准？",
     ml_how_body: `<b>模型</b>：梯度提升树（scikit-learn HistGradientBoosting），分位数回归，每个集群单独一组，预测 q20 / q50 / q80 三个分位数 → “大概 X，多半在 A–B 之间”。QoS、分区是模型里的特征（每个队列单独训练数据太少）。<br>
-<b>特征</b>：申请的核数 / GPU / 节点 / 时长；<b>可以排队那一刻</b>该 QoS 全集群的运行 / 排队数、你自己的运行 / 排队数、该分区的积压估计（CPU / GPU）、Slurm 自己的估计和原因、已经排了多久。“那一刻”取第一次看到它排队时记下的状态，没有就用前后 2 小时内最近的刷新快照 —— 所以刷新越频繁（config.yaml 里 <code>auto_refresh_minutes</code>），数据越好。<br>
+<b>特征</b>：申请的核数 / GPU / 节点 / 时长；<b>可以排队那一刻</b>该 QoS 全集群的运行 / 排队数、你自己的运行 / 排队数、该分区的积压估计（CPU / GPU）、Slurm 自己的估计和原因、已经排了多久；<b>你最近的用量</b>（按 7 天半衰期衰减的核时，fairshare 就是看它）和正在跑的核数；几点、星期几交的。“那一刻”取第一次看到它排队时记下的状态，没有就用前后 2 小时内最近的刷新快照 —— 所以刷新越频繁（config.yaml 里 <code>auto_refresh_minutes</code>），数据越好。<br>
 <b>依赖</b>：等待一律从 eligible（依赖满足）算起，前置 job 没结束之前排到队头也不会开始。还在等依赖的 job，开始时间 = 前置 job 预计结束（开始 + 时限，偏保守）+ 模型预测的排队时间。<br>
 <b>准不准</b>：每次训练都会按时间回测（用早期数据预测后来的 job），和“历史分位数”（同 QoS + 分区以前等了多久）比，哪个集群历史分位数更准就自动用它。“差不多对” = 误差在 2 倍以内或 15 分钟以内；“区间覆盖” = 真实值落在 q20–q80 里的比例（理想 60%）。一批一起交的 job 只算一份。排队本来就很随机（别人什么时候交、fairshare……），数据少的时候只能当参考；数据攒多了点一下“训练 / 更新模型”就会更新。`,
     ml_train: "训练 / 更新模型", ml_training: "训练中…",
@@ -410,25 +447,67 @@ const I18N = {
     ml_best_title: "各集群最快：",
     rec_edit: "改参数", rec_training: "⏱ 正在训练排队预测模型（几秒）…",
     rec_no_model: "⏱ 还没有排队预测模型，训练一下就能看到“现在交哪里等得最短”（几秒）",
-    th_ml_col: "模型预测", th_ml_col_tip: "现在交一个“典型 job”要排多久（模型 q50，小字是 q20–q80）。典型 job = 你在这个 QoS + 分区交过的 job 的中位数；没交过就用你在这个集群的中位数。悬停看具体参数",
+    th_wait: "预计等待", th_wait_tip: "现在交一个“典型 job”要排多久。粗体 = 模型的中位数（q50），小字 = q20–q80；“≤” = 积压估计（假设完美排满，把现在所有的活清空要多久），当上界看：young / sulis 上 50 批 job 实际等待都没超过它的 36%。典型 job = 你在这个 QoS + 分区交过的 job 的中位数；没交过就用你在这个集群的中位数。悬停看具体参数",
+    bl_tip_line: (a, b) => `积压估计 CPU：${a}（只算本分区）– ${b}（算上共享节点的分区）`, bl_tip_gpu: (g, a, b) => `积压估计 GPU ${g}：${a} – ${b}`,
     ml_tree_tip: (job, own, a, b, n) => `按 ${job} 的 job 估计（${own ? "你在这里交过的 job 的中位数" : "你没在这里交过，用你在这个集群的中位数"}）\n多半在 ${a} – ${b}\n历史上在这里开始过 ${n} 批 job`,
     fastest: "最快", fastest_tip: "这个集群里模型预测排队最短的（数据够的）分区", ml_rec_none: "推荐：没有数据够的选项",
     auto_off: "自动刷新：关", auto_every: h => `自动：每 ${h}h`, auto_min: m => `自动：每 ${m} 分钟`,
     auto_next: s => `下次自动刷新：${s}`,
     ml_n_tip: "这个 QoS + 分区历史上开始过几批 job（一起交的算一批；少于 3 批的预测不可靠，排在后面）",
+    view_details: "详细数据", view_charts: "图表",
+    c_alloc: "在用", c_idle: "空闲", c_down: "宕机 / 维护",
+    c_part_tip: (p, a, i, o, tot, unit) => `${p}：${unit} ${a} 在用 · ${i} 空闲 · ${o} 宕机/维护 · 共 ${tot}`,
+    c_queued: n => `全集群排队 ${n}`, c_mine: (r, p) => `我的 ${r} 跑 / ${p} 排`, c_wait: w => `预计等 ${w}`,
+    c_no_nodes: "看不到节点占用", c_nodes: "节点", c_cpus: "CPU",
+    c_rank_head: "排位：你的 job 在队伍里的位置（左边先开始），下面是其他人 job 的优先级分布",
+    c_rank_tip: (p, a, m, u, n) => `${p}：你最靠前的 job 排第 ${a} / ${m}，前面有 ${u} 个用户\n你在这里排队的 job：${n} 个`,
+    c_hist_tip: (a, b, n) => `优先级 ${a} – ${b}：别人的 ${n} 个 job`, c_you_prio: p => `你的优先级 ${p}`,
+    c_others_median: m => `别人的中位数 ${m}`,
+    c_run_tip: (p, n) => `${p}：你有 ${n} 个 job 正在跑`, c_queue_tip: (p, q) => `${p}：别人排队的 job ${q} 个`,
+    c_run_only: (n, q) => `${n} 个在跑，没有排队` + (q ? `（别人排队 ${q} 个）` : ""),
+    c_leg_run: "我在跑的", c_leg_mine: "我排队的", c_leg_others: "别人排队的",
+    g_running: "在跑（淡色 = 到时限还剩）", g_pending: "预计开始 q20–q80（竖线 = 中位数，淡色 = 跑完的时间）",
+    g_dep: "等依赖（虚线）", g_now: "现在", g_more: n => `还有 ${n} 组没画，点“详细数据”看全部`,
+    g_none: "没有符合筛选的在跑 / 排队的 job", g_click: "点一行跳到表格里",
+    g_tip_run: (id, s, l) => `#${id} 在跑：${s} 开始，时限 ${l}`,
+    g_tip_pd: (id, a, m, b) => `#${id} 预计开始 ${m}（多半在 ${a} – ${b}）`,
+    g_beyond: d => `→ ${d}`,
+    cal_head: "网页当时给的预测（第一次看到它排队时）vs 实际等了多久；每个点一个 job，灰带 = 误差在 2 倍以内",
+    cal_title: (c, n, nb, h, hb) => `${c}：${n} 个 job（${nb} 批），${h} 在 2 倍以内（按批 ${hb}）`, cal_x: "预测", cal_y: "实际",
+    cal_none: "还没有记录（需要模型给出预测、job 开始以后才有）", tr_loading: "加载中…",
+    cal_tip: (id, p, a) => `#${id}\n预测 ${p} · 实际 ${a}`,
+    tr_head: (d) => `最近 ${d} 天，上下几条共用时间轴：我的 job 数 → 我的用量（fairshare 就是看它）→ 我的 job 排队时的优先级 → 实际等待`,
+    tr_jobs: "我的 job（绿 = 在跑，黄 = 排队）", tr_usage: h => `我的用量（核时，按 ${h} 天半衰期衰减）`,
+    tr_prio: "排队时的优先级", tr_wait: "实际等待（对数）", tr_none: "这段时间没有数据",
+    tr_tip_jobs: (t, r, p) => `${t}\n在跑 ${r} · 排队 ${p}`, tr_tip_usage: (t, u) => `${t}\n用量 ${u} 核时`,
+    tr_tip_prio: (t, p) => `${t}\n优先级 ${p}`, tr_tip_wait: (id, t, w) => `#${id}\n${t} 可以开始排队，等了 ${w}`,
+    fs_one: (v, s) => `fairshare <b>${v}</b>${s ? `（${s}）` : ""}`,
+    fs_many: (a, b, n) => `fairshare <b>${a} – ${b}</b>（${n} 个账户）`,
+    fs_used_x: x => `用了份额的 ${x} 倍`, fs_unused: "最近没用过",
+    fs_cmp: (cls, h, n) => `比 ${n} 个有排队 job 的用户里的 <span class="${cls}" style="font-weight:600">${h}</span> 个低`,
+    fs_lead: k => `优先级主要看 ${k}`,
+    fs_tip: "fairshare 0–1，越高优先级越高：用得比份额多就降，随着用量衰减慢慢回升",
+    fs_weights: "优先级权重：",
+    th_rank: "排位", th_rank_tip: "你在这个分区最靠前的那个排队 job 排第几 / 一共几个（只算现在能开始的：等依赖、被 hold 的不算）。backfill 仍可能让小 job 插队。悬停看详细",
+    rank_tip: (p, n, a, m, ua, u, mine, med) => `${p}：你有 ${n} 个 job 在这里排队，最靠前的排第 ${a} / ${m}\n前面有 ${ua} / ${u} 个用户\n你的优先级 ${mine}，其他人的中位数 ${med}`,
+    rank_alone: (p, n) => `${p}：你有 ${n} 个 job 在这里排队，没有别人在排`,
+    prio_tip: (p, f) => `优先级 ${p} = ${f}`,
+    prio_tip_part: (p, a, m, u) => `${p}：第 ${a} / ${m}（前面 ${u} 个用户）`,
+    prio_tip_alone: p => `${p}：没有别人在排`,
   },
   en: {
     never_refreshed: "Not refreshed yet",
     updated_at: s => "Updated " + s,
     all_clusters: "All clusters", all_qos: "All QoS",
     f_all_states: "All states", f_active: "Active (running + pending)", f_running: "Running", f_pending: "Pending (not deps)", f_dep: "Waiting on deps",
-    f_done: "Finished", f_failed: "Last one failed/cancelled",
+    f_just_done: "Finished since last refresh", f_done: "Finished", f_failed: "Last one failed/cancelled",
     search_ph: "Search job id / name / node / QoS",
     refresh: "Refresh", refreshing: "Refreshing…", queued_btn: "Queued",
     collapse: "Hide", expand: "Show", expand_all: "Expand all", collapse_all: "Collapse all", show_all: "Show all",
     bl_title: "Backlog", bl_how: "How is the backlog computed? (how long each partition needs to drain its current work; updated every few minutes)",
     bl_how_body: `Sum (remaining time × cores) over all jobs in a partition and divide by the partition's total cores: "how long to clear the current work if it packed perfectly". GPUs are the same, counted in cards.<br>
-      The first number (Local) only counts this partition; the second (Global) includes partitions sharing the same nodes (e.g. gpu / gpulowpri / gpu-devel sharing one GPU pool). Real waits usually fall in between.<br>
+      The first number (Local) only counts this partition; the second (Global) includes partitions sharing the same nodes (e.g. gpu / gpulowpri / gpu-devel sharing one GPU pool).<br>
+      In practice it is an <b>upper bound</b>: most jobs finish before their time limit, jobs behind you in the queue are counted too, and backfill fills gaps. On young / sulis no batch out of 50 waited more than 36% of it, so the partition table shows it as "≤" next to the model's prediction.<br>
       Your pending jobs in the table below show a "backlog" estimate: the slowest of CPU / GPU (the bottleneck), and the fastest of the candidate partitions. It's only a rough guide: priority, fairshare and backfill are not modelled.<br>
       "Line cutters" are other users' jobs in your partition, submitted after your earliest pending job but already running, usually via backfill (short time / few resources).`,
     jobs_hint: "Jobs with the same name on a cluster share one row · expanding reads each job's working folder · click a Job ID / path to copy",
@@ -454,8 +533,9 @@ const I18N = {
     load_private_tip: "squeue on this cluster only shows your own jobs (PrivateData), so cluster-wide numbers are unavailable",
     load_tip: "Running / pending jobs of all users in this QoS", load_off_tip: "Cluster-wide counts are off for this cluster (disable: [cluster_load])",
     sub_full: "submit cap", run_full: "run cap", hidden: "hidden",
-    mine_summary: (r, p, d) => `Mine: <span class="n-r">${r}</span> running${d ? ` (<span class="dep-n" title="${esc(t("dep_tip"))}">+${d}</span> waiting on deps)` : ""} · <span class="n-pd">${p}</span> pending`,
-    dep_tip: "In brackets: jobs waiting on dependencies; they only start after their predecessors end, so they aren't counted as queueing",
+    mine_summary: (r, p, dr, dq) => `Mine: <span class="n-r">${r}</span> running${dr ? ` (<span class="dep-n" title="${esc(t("dep_tip_run"))}">+${dr}</span> waiting on deps)` : ""} · <span class="n-pd">${p}</span> pending${dq ? ` (<span class="dep-n" title="${esc(t("dep_tip_queue"))}">+${dq}</span> waiting on deps)` : ""}`,
+    dep_tip_run: "Waiting on dependencies whose predecessor is running: they're next once it ends (not counted as queueing)",
+    dep_tip_queue: "Waiting on dependencies whose predecessor (or the head of the chain) is still queued: they start only after it gets through the queue and ends (not counted as queueing)",
     data_at: s => `data from ${s}`,
     th_mine: "Mine", th_all: "Cluster",
     th_maxjobs_tip: "Max running jobs per user (MaxJobsPU)", th_maxsubmit_tip: "Max submitted jobs per user (MaxSubmitPU)",
@@ -465,8 +545,7 @@ const I18N = {
     gpu_pool: "GPU pools: ", pool_item: (t, n, ps) => `<b>${t}</b> ${n} cards (shared by ${ps})`,
     cutters: (n, k) => `Line cutters: ${n} later-submitted jobs already running${k ? ` (newest ${k} shown)` : ""}`,
     th_account: "Account", th_res: "Resources", th_limit: "Time limit", th_reason: "Likely reason",
-    th_cpus: "Cores", th_gpus: "GPUs", th_cpu_bl: "CPU backlog", th_gpu_bl: "GPU backlog",
-    bl_range_tip: "Local (this partition only) – Global (incl. partitions sharing nodes)",
+    th_cpus: "Cores", th_gpus: "GPUs",
     alerts: n => `Alerts ${n}`, al_same_dir: "same folder",
     al_same_dir_msg: n => `${n} jobs running in the same folder (dependency may be wrong): `, al_stale: " (old data)",
     al_big_dir: "folder too large", al_many_files: "too many files", n_entries: n => `${n} files`,
@@ -502,6 +581,10 @@ const I18N = {
     part_no_info: c => c.scheduler === "sge" ? "SGE has no partition info; grouped by the parallel environment (PE) of your jobs" : "sinfo isn't allowed on this cluster; only your own jobs are counted",
     part_chip: p => `Partition: ${p} ✕`,
     al_waitlog_full_msg: (s, l) => `${s} MB > ${l} MB, stopped writing wait-time data. Clean up or archive the folder, or raise waitlog_max_mb in config.yaml: `,
+    done_title: "Finished since last refresh", done_none: "No job finished between the last two refreshes",
+    done_since: (a, b) => `${a} → ${b}`, done_exit: "Exit", done_end: "Ended", done_ran: "Ran",
+    done_gone: "vanished", done_gone_tip: "Was running/pending last time, now in neither the queue nor the history (older than the history window, or SGE has not written its accounting record yet)",
+    done_hint: "Success, failure and cancel all count · each cluster is compared with its own previous successful refresh · click a row to jump to it in Jobs",
     hist_title: "Queue history", hist_hint: "From waitlog/jobs.csv · wait = start − eligible (dependencies met) · click a summary row to filter the jobs below",
     hist_d7: "Last 7 days", hist_d30: "Last 30 days", hist_d90: "Last 90 days", hist_d365: "Last year", hist_dall: "All",
     hist_search_ph: "Search job id / name / node / partition",
@@ -519,7 +602,7 @@ const I18N = {
     ml_title: "Wait prediction", ml_hint: "A small model trained on waitlog data: start-time estimates for pending jobs (purple “model” in the Jobs time column) + where a new job would start soonest",
     ml_how: "How does it work? How accurate is it?",
     ml_how_body: `<b>Model</b>: gradient-boosted trees (scikit-learn HistGradientBoosting), quantile regression, one set per cluster, predicting q20 / q50 / q80 → “about X, likely between A and B”. QoS and partition are features inside the model (too little data to train each queue separately).<br>
-<b>Features</b>: requested cores / GPUs / nodes / time; <b>at the moment the job became eligible</b>: cluster-wide running / pending in its QoS, your own running / pending, the partition's backlog estimate (CPU / GPU), Slurm's own estimate and reason, time already waited. Taken from when the job was first seen pending, else the nearest refresh snapshot within 2 h — so refreshing more often (<code>auto_refresh_minutes</code> in config.yaml) gives better data.<br>
+<b>Features</b>: requested cores / GPUs / nodes / time; <b>at the moment the job became eligible</b>: cluster-wide running / pending in its QoS, your own running / pending, the partition's backlog estimate (CPU / GPU), Slurm's own estimate and reason, time already waited; <b>your recent usage</b> (CPU-hours with a 7-day half-life, what fairshare looks at) and cores running now; hour and weekday. Taken from when the job was first seen pending, else the nearest refresh snapshot within 2 h — so refreshing more often (<code>auto_refresh_minutes</code> in config.yaml) gives better data.<br>
 <b>Dependencies</b>: waits are always measured from eligible (dependencies met); a job won't start before its predecessors end even at the head of the queue. For jobs still waiting on dependencies: start = predecessors' estimated end (start + time limit, conservative) + predicted queue wait.<br>
 <b>Accuracy</b>: every training run backtests over time (early data predicts later jobs) against “historical quantiles” (how long this QoS + partition waited before); clusters where those are better use them automatically. “Roughly right” = within 2× or 15 minutes; “interval coverage” = share of real waits inside q20–q80 (ideal 60%). A batch submitted together counts once. Queueing is noisy (other users, fairshare…), so treat this as a hint; click “Train / update model” as more data accumulates.`,
     ml_train: "Train / update model", ml_training: "Training…",
@@ -541,12 +624,53 @@ const I18N = {
     ml_best_title: "Fastest per cluster:",
     rec_edit: "Change", rec_training: "⏱ Training the wait-prediction model (a few seconds)…",
     rec_no_model: "⏱ No wait-prediction model yet; train one to see where a job would start soonest (a few seconds)",
-    th_ml_col: "Model", th_ml_col_tip: "How long a “typical job” submitted now would wait (model q50; small text = q20–q80). Typical job = median of your jobs in this QoS + partition, else your median on this cluster. Hover for the parameters",
+    th_wait: "Expected wait", th_wait_tip: "How long a “typical job” submitted now would wait. Bold = model median (q50), small = q20–q80; “≤” = backlog estimate (time to clear all current work if packed perfectly), treat it as an upper bound: on young / sulis no batch out of 50 waited more than 36% of it. Typical job = median of your jobs in this QoS + partition, else your median on this cluster. Hover for the parameters",
+    bl_tip_line: (a, b) => `Backlog CPU: ${a} (this partition only) – ${b} (incl. partitions sharing nodes)`, bl_tip_gpu: (g, a, b) => `Backlog GPU ${g}: ${a} – ${b}`,
     ml_tree_tip: (job, own, a, b, n) => `For a ${job} job (${own ? "median of your jobs here" : "you haven't submitted here; your median on this cluster"})\nLikely ${a} – ${b}\n${n} batches started here before`,
     fastest: "fastest", fastest_tip: "The partition on this cluster with the shortest predicted wait (with enough data)", ml_rec_none: "Recommendation: no option with enough data",
     auto_off: "Auto refresh: off", auto_every: h => `Auto: every ${h}h`, auto_min: m => `Auto: every ${m} min`,
     auto_next: s => `Next auto refresh: ${s}`,
     ml_n_tip: "Batches of jobs that started in this QoS + partition before (jobs submitted together = one batch; under 3 = unreliable, sorted last)",
+    view_details: "Details", view_charts: "Charts",
+    c_alloc: "allocated", c_idle: "idle", c_down: "down / drained",
+    c_part_tip: (p, a, i, o, tot, unit) => `${p}: ${unit} ${a} allocated · ${i} idle · ${o} down/drained · ${tot} total`,
+    c_queued: n => `${n} queued (all users)`, c_mine: (r, p) => `mine ${r} run / ${p} queued`, c_wait: w => `wait ~${w}`,
+    c_no_nodes: "node usage not visible", c_nodes: "nodes", c_cpus: "CPUs",
+    c_rank_head: "Position: where your jobs stand in the queue (left starts first); below, the priority spread of other users' jobs",
+    c_rank_tip: (p, a, m, u, n) => `${p}: your best job is #${a} of ${m}, ${u} users ahead\nYour jobs queued here: ${n}`,
+    c_hist_tip: (a, b, n) => `priority ${a} – ${b}: ${n} jobs of other users`, c_you_prio: p => `your priority ${p}`,
+    c_others_median: m => `others' median ${m}`,
+    c_run_tip: (p, n) => `${p}: ${n} of your jobs running`, c_queue_tip: (p, q) => `${p}: ${q} jobs of other users queued`,
+    c_run_only: (n, q) => `${n} running, none queued` + (q ? ` (${q} queued by others)` : ""),
+    c_leg_run: "mine running", c_leg_mine: "mine queued", c_leg_others: "others queued",
+    g_running: "running (faded = left until time limit)", g_pending: "predicted start q20–q80 (tick = median, faded = run time)",
+    g_dep: "waiting on deps (dashed)", g_now: "now", g_more: n => `${n} more groups not drawn; see Details`,
+    g_none: "No running / queued jobs match the filters", g_click: "Click a row to jump to it in the table",
+    g_tip_run: (id, s, l) => `#${id} running: started ${s}, limit ${l}`,
+    g_tip_pd: (id, a, m, b) => `#${id} predicted start ${m} (likely ${a} – ${b})`,
+    g_beyond: d => `→ ${d}`,
+    cal_head: "What the page predicted (when the job was first seen queueing) vs how long it actually waited; one dot per job, grey band = within 2×",
+    cal_title: (c, n, nb, h, hb) => `${c}: ${n} jobs (${nb} batches), ${h} within 2× (${hb} by batch)`, cal_x: "predicted", cal_y: "actual",
+    cal_none: "Nothing recorded yet (needs a model prediction and the job to start)", tr_loading: "Loading…",
+    cal_tip: (id, p, a) => `#${id}\npredicted ${p} · actual ${a}`,
+    tr_head: (d) => `Last ${d} days, one shared time axis: my jobs → my usage (what fairshare looks at) → my jobs' priority when queued → actual wait`,
+    tr_jobs: "My jobs (green = running, yellow = queued)", tr_usage: h => `My usage (CPU-hours, ${h}-day half-life)`,
+    tr_prio: "Priority when queued", tr_wait: "Actual wait (log)", tr_none: "No data in this period",
+    tr_tip_jobs: (t, r, p) => `${t}\nrunning ${r} · queued ${p}`, tr_tip_usage: (t, u) => `${t}\nusage ${u} CPU-h`,
+    tr_tip_prio: (t, p) => `${t}\npriority ${p}`, tr_tip_wait: (id, t, w) => `#${id}\neligible ${t}, waited ${w}`,
+    fs_one: (v, s) => `fairshare <b>${v}</b>${s ? ` (${s})` : ""}`,
+    fs_many: (a, b, n) => `fairshare <b>${a} – ${b}</b> (${n} accounts)`,
+    fs_used_x: x => `used ${x}× your share`, fs_unused: "unused lately",
+    fs_cmp: (cls, h, n) => `lower than <span class="${cls}" style="font-weight:600">${h}</span> of ${n} users with queued jobs`,
+    fs_lead: k => `priority is mostly ${k}`,
+    fs_tip: "fairshare 0–1, higher = more priority: drops when you use more than your share, recovers as usage decays",
+    fs_weights: "Priority weights: ",
+    th_rank: "Position", th_rank_tip: "Where your best-placed pending job in this partition stands / how many (only jobs that can start now: waiting on deps or held don't count). Backfill can still start small jobs out of order. Hover for details",
+    rank_tip: (p, n, a, m, ua, u, mine, med) => `${p}: ${n} of your jobs queued here, the best is #${a} of ${m}\n${ua} of ${u} users ahead\nYour priority ${mine}, others' median ${med}`,
+    rank_alone: (p, n) => `${p}: ${n} of your jobs queued here, nobody else queued`,
+    prio_tip: (p, f) => `Priority ${p} = ${f}`,
+    prio_tip_part: (p, a, m, u) => `${p}: #${a} of ${m} (${u} users ahead)`,
+    prio_tip_alone: p => `${p}: nobody else queued`,
   },
 };
 function loadPref(k, d){ try{ const v = localStorage.getItem("hpcdash." + k); return v === null ? d : JSON.parse(v); }catch(e){ return d; } }
@@ -603,6 +727,7 @@ let pendingInspect = new Set();
 let lastData = null;
 let jobsByKey = {};
 let groupOfJob = {};
+let justDone = new Set();         // 上次刷新以来结束的 job（cluster:id）
 
 // 显示用的状态：排队中但还在等前置 job 的显示成 DEPEND（不算真正在排队）
 const dispState = j => PEND.has(j.state) && j.dep_wait ? "DEPEND" : j.state;
@@ -652,6 +777,7 @@ function groupVisible(g){
     case "running": if (g.rank !== 0) return false; break;
     case "pending": if (!g.jobs.some(queueing)) return false; break;
     case "dep":     if (!g.jobs.some(j => PEND.has(j.state) && j.dep_wait)) return false; break;
+    case "just_done": if (!g.jobs.some(j => justDone.has(jobKey(j)))) return false; break;
     case "done":    if (g.rank !== 2) return false; break;
     case "failed":  if (g.rank !== 2 || !BAD.has(s)) return false; break;
   }
@@ -663,10 +789,347 @@ function groupVisible(g){
   return true;
 }
 
+// ---------------- 图表：每块默认显示图，标题旁“详细数据”切回数字 ----------------
+let views = {ov: "chart", ml: "chart", jobs: "chart", hist: "chart", ...loadPref("views", {})};
+const isChart = sec => views[sec] !== "data";
+function renderViewBtns(){
+  document.querySelectorAll(".viewBtn").forEach(b => { b.textContent = isChart(b.dataset.view) ? t("view_details") : t("view_charts"); });
+  for (const id of ["expandAll", "collapseAll"]) document.getElementById(id).style.display = isChart("jobs") ? "none" : "";
+}
+const tip = s => ` data-tip="${esc(s)}"`;
+const lin = (d0, d1, r0, r1) => v => r0 + (v - d0) / ((d1 - d0) || 1) * (r1 - r0);
+const logS = (d0, d1, r0, r1) => { const a = Math.log(d0), b = Math.log(d1); return v => r0 + (Math.log(Math.max(v, d0)) - a) / ((b - a) || 1) * (r1 - r0); };
+const tms = s => s ? new Date(s).getTime() : NaN;  // 集群 / 本机的本地时间字符串
+const pad2 = n => String(n).padStart(2, "0");
+const fmtMs = ms => { const d = new Date(ms); return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+// Slurm 时长 [D-][HH:]MM:SS -> 小时
+const durH = s => { const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(s || ""); return m ? (+(m[1] || 0)) * 24 + (+(m[2] || 0)) + (+m[3]) / 60 + (+m[4]) / 3600 : null; };
+const vizWidth = el => Math.max(360, (el.clientWidth || 900) - 24);
+const legend = items => `<div class="legend">${items.map(([cls, style, label]) => `<span><i class="${cls}" style="${style}"></i>${esc(label)}</span>`).join("")}</div>`;
+const svg = (w, h, inner, fluid) => `<svg ${fluid ? `viewBox="0 0 ${w} ${h}" width="100%"` : `width="${w}" height="${h}"`} xmlns="http://www.w3.org/2000/svg">${inner}</svg>`;
+// 时间轴刻度：按范围挑间隔，00:00 标日期
+function timeTicks(t0, t1, x, y, labelY){
+  const spanH = (t1 - t0) / 3.6e6;
+  const step = spanH <= 36 ? 6 : spanH <= 96 ? 12 : spanH <= 24 * 10 ? 24 : spanH <= 24 * 40 ? 24 * 3 : 24 * 7;
+  // 按日历走（夏令时切换那天也对得上整点）
+  const d = new Date(t0); d.setMinutes(0, 0, 0);
+  if (step >= 24){ d.setHours(24, 0, 0, 0); } else d.setHours(Math.ceil(d.getHours() / step) * step);
+  let out = "";
+  for (; d.getTime() <= t1; step >= 24 ? d.setDate(d.getDate() + step / 24) : d.setHours(d.getHours() + step)){
+    const ms = d.getTime(), dd = d, X = x(ms);
+    out += `<line x1="${X}" x2="${X}" y1="0" y2="${y}" stroke="var(--c-grid)"/>`
+      + `<text x="${X}" y="${labelY}" text-anchor="middle">${dd.getHours() === 0 ? `${pad2(dd.getMonth() + 1)}-${pad2(dd.getDate())}` : `${pad2(dd.getHours())}:00`}</text>`;
+  }
+  return out;
+}
+const vizTip = document.getElementById("vizTip");
+document.addEventListener("mousemove", e => {
+  const el = e.target.closest ? e.target.closest(".viz [data-tip]") : null;
+  if (!el){ vizTip.style.display = "none"; return; }
+  vizTip.textContent = el.dataset.tip;
+  vizTip.style.display = "block";
+  const w = vizTip.offsetWidth, h = vizTip.offsetHeight;
+  vizTip.style.left = Math.max(8, Math.min(e.clientX + 14, innerWidth - w - 8)) + "px";
+  vizTip.style.top = (e.clientY + 18 + h > innerHeight ? e.clientY - h - 10 : e.clientY + 18) + "px";
+});
+
+// 趋势数据（/api/trends）：预测 vs 实际、排队历史的图都用它；每次刷新后重新拿一次
+let trendsData = null, trendsFor = undefined, trendsLoading = false;
+async function loadTrends(){
+  const key = lastData ? lastData.updated_at : null;
+  if (trendsLoading || trendsFor === key) return;
+  trendsLoading = true;
+  try{ trendsData = await (await fetch("api/trends?days=365")).json(); }catch(e){ trendsData = {ok: false, error: String(e)}; }
+  trendsFor = key; trendsLoading = false;
+  renderModel(); renderHistory();
+}
+
+// ---- ⑤ + ② 集群卡片：分区占用 + 排位 ----
+function cardChart(c, ov, rankBy, fsParts, runBy){
+  const W = 840, LX = 0, BX = 140, BW = 280, TX = BX + BW + 12;  // 右边文字英文更长，留够地方
+  // 同名分区可能挂在好几个 QoS 下面：我的数加起来，预计等待取最快的
+  const parts = {};
+  for (const g of ov.groups) for (const ch of g.children){
+    if (ch.hidden) continue;
+    const a = parts[ch.name] || (parts[ch.name] = {r: 0, p: 0, ml: null});
+    a.r += ch.mine_running || 0; a.p += (ch.mine_pending || 0);
+    if (ch.ml && (!a.ml || ch.ml.wait[1] < a.ml.wait[1])) a.ml = ch.ml;
+  }
+  const names = Object.keys(parts);
+  let y = 0, body = "", anyBar = false;
+  for (const name of names){
+    const p = (ov.partitions || {})[name] || {}, a = parts[name];
+    const u = p.nodes && p.nodes.idle !== undefined ? [p.nodes, t("c_nodes")] : p.cpus && p.cpus.idle !== undefined ? [p.cpus, t("c_cpus")] : null;
+    body += `<text class="lab" x="${LX}" y="${y + 14}">${esc(name.length > 22 ? name.slice(0, 21) + "…" : name)}</text>`;
+    if (u){
+      const [n, unit] = u, x = lin(0, n.total, BX, BX + BW);
+      anyBar = true;
+      const segs = [[n.alloc, "var(--c1)"], [n.idle, "var(--c3)"], [n.other || 0, "var(--c-down)"]];
+      let x0 = BX;
+      const tipS = t("c_part_tip", name, n.alloc, n.idle, n.other || 0, n.total, unit);
+      for (const [v, col] of segs){
+        if (!v) continue;
+        const wd = Math.max(x(v) - BX - 2, 1.5);
+        body += `<rect x="${x0}" y="${y + 4}" width="${wd}" height="13" rx="2" fill="${col}"${tip(tipS)}/>`;
+        x0 += wd + 2;
+      }
+    } else body += `<text x="${BX}" y="${y + 14}">${esc(t("c_no_nodes"))}${p.nodes && p.nodes.total ? ` · ${p.nodes.total} ${t("c_nodes")}` : ""}</text>`;
+    const bits = [t("c_mine", a.r, a.p)];
+    if (p.all_pending !== undefined && p.all_pending !== null && !c.load_private) bits.push(t("c_queued", p.all_pending));
+    if (a.ml) bits.push(t("c_wait", fmtH(a.ml.wait[1])));
+    body += `<text x="${TX}" y="${y + 14}">${esc(bits.join(" · "))}</text>`;
+    y += 24;
+  }
+  let out = names.length ? svg(W, y, body, true) + (anyBar ? legend([["", "background:var(--c1)", t("c_alloc")], ["", "background:var(--c3)", t("c_idle")], ["", "background:var(--c-down)", t("c_down")]]) : "")
+    : `<div class="empty">${t("no_qos")}</div>`;
+  // 排位：一条“队伍”（最前面绿色 = 我在跑的，后面是排队的，蓝线 = 我的）+ 别人优先级的直方图（我的优先级在哪）
+  const load = pn => ((rankBy[pn] || {}).n || 0) + (runBy[pn] || 0);
+  const pnames = [...new Set([...Object.keys(rankBy), ...Object.keys(runBy)])].sort((a, b) => load(b) - load(a));
+  if (pnames.length){
+    let rb = "", ry = 0;
+    for (const pn of pnames){
+      const r = rankBy[pn], nr = runBy[pn] || 0, st = fsParts[pn] || {};
+      const q = (st.competing || 0) + (r ? 1 : 0);  // 队伍长度：别人的 + 我最靠前的那个
+      rb += `<text class="lab" x="${LX}" y="${ry + 12}">${esc(pn)}</text>`;
+      if (r){
+        const cls = st.competing ? rankCls(r.best.ahead, q) : "h-ok", col = cls === "h-ok" ? "var(--ok)" : cls === "h-mid" ? "var(--warn)" : "var(--bad)";
+        rb += `<text x="${LX}" y="${ry + 27}" style="fill:${col};font-weight:600">#${r.best.ahead + 1} / ${q}</text>`;
+      }
+      const a = parts[pn];  // 和上面分区条用同一个数（含等依赖的）
+      rb += `<text x="${LX}" y="${ry + (r ? 42 : 27)}">${esc(t("c_mine", a ? a.r : nr, a ? a.p : r ? r.n : 0))}</text>`;
+      // 绿色段按“在跑的 + 排队的”比例画，至少 3px 看得见；没人排队就整条绿
+      const gw = !nr ? 0 : !q ? BW : Math.min(Math.max(BW * nr / (nr + q), 3), BW - 8);
+      if (gw) rb += `<rect x="${BX}" y="${ry + 3}" width="${gw}" height="11" rx="2" fill="var(--ok)"${tip(t("c_run_tip", pn, nr))}/>`;
+      if (q){
+        const qx0 = BX + gw + (gw ? 2 : 0), qw = BX + BW - qx0, x = lin(0, q, qx0, BX + BW);
+        const qtip = r ? t("c_rank_tip", pn, r.best.ahead + 1, q, r.best.users_ahead, r.n) : t("c_queue_tip", pn, q);
+        rb += `<rect x="${qx0}" y="${ry + 3}" width="${qw}" height="11" rx="2" fill="var(--c-other)"${tip(qtip)}/>`;
+        if (r) for (const ah of r.aheads) rb += `<rect x="${x(ah)}" y="${ry + 3}" width="${Math.max(qw / q, 1.5)}" height="11" fill="var(--c1)" pointer-events="none"/>`;
+      }
+      // 直方图
+      const hst = r && st.competing ? st.hist : null;
+      if (hst){
+        const lo = Math.min(hst.edges[0], r.lo), hi = Math.max(hst.edges[hst.edges.length - 1], r.hi);
+        const hx = logS(Math.max(lo, 1), Math.max(hi, 2), BX, BX + BW), cmax = Math.max(...hst.counts, 1), HY = ry + 20, HH = 34;
+        hst.counts.forEach((n, k) => {
+          if (!n) return;
+          const x0 = hx(hst.edges[k]), x1 = hx(hst.edges[k + 1]), hgt = Math.max(n / cmax * HH, 1.5);
+          rb += `<rect x="${x0 + 0.5}" y="${HY + HH - hgt}" width="${Math.max(x1 - x0 - 1, 1)}" height="${hgt}" fill="#56607a"${tip(t("c_hist_tip", kFmt(hst.edges[k]), kFmt(hst.edges[k + 1]), n))}/>`;
+        });
+        const xm = hx(st.median);
+        rb += `<line x1="${xm}" x2="${xm}" y1="${HY - 2}" y2="${HY + HH}" stroke="var(--muted)" stroke-dasharray="3 3"${tip(t("c_others_median", kFmt(st.median)))}/>`;
+        for (const v of new Set([r.lo, r.hi])){
+          const xv = hx(v);
+          rb += `<line x1="${xv}" x2="${xv}" y1="${HY - 4}" y2="${HY + HH}" stroke="var(--c1)" stroke-width="2"${tip(t("c_you_prio", kFmt(v)))}/>`;
+        }
+        rb += `<text x="${TX}" y="${ry + 12}">${esc(t("c_you_prio", kFmt(r.lo) + (kFmt(r.hi) !== kFmt(r.lo) ? "–" + kFmt(r.hi) : "")))}</text>`
+          + `<text x="${TX}" y="${ry + 27}">${esc(t("c_others_median", kFmt(st.median)))}</text>`;
+        ry += 62;
+      } else {
+        rb += `<text x="${TX}" y="${ry + 12}">${esc(r ? (st.competing ? "" : t("rank_alone", pn, r.n)) : t("c_run_only", nr, st.competing || 0))}</text>`;
+        ry += r ? 50 : 36;
+      }
+    }
+    out += `<div class="sub">${esc(t("c_rank_head"))}</div>` + svg(W, ry, rb, true)
+      + legend([["", "background:var(--ok)", t("c_leg_run")], ["", "background:var(--c1)", t("c_leg_mine")], ["", "background:var(--c-other)", t("c_leg_others")]]);
+  }
+  return `<div class="viz">${out}</div>`;
+}
+
+// ---- ① Jobs：时间线 ----
+function renderGantt(groups){
+  const wrap = document.getElementById("ganttWrap"), chart = isChart("jobs");
+  wrap.style.display = chart ? "" : "none";
+  document.getElementById("jobsTableWrap").style.display = chart ? "none" : "";
+  if (!chart) return;
+  const now = Date.now(), t0 = now - 48 * 3.6e6, t1 = now + 96 * 3.6e6;
+  const rows = [];
+  for (const g of groups){
+    const run = g.jobs.filter(j => ACTIVE.has(j.state)), pend = g.jobs.filter(j => PEND.has(j.state));
+    if (!run.length && !pend.length) continue;
+    const est = pend.find(j => j.ml_est && j.ml_est.start && !j.dep_wait) || pend.find(j => j.ml_est && j.ml_est.start) || null;
+    const key = run.length ? Math.min(...run.map(j => tms(j.start) || now)) - 1e13 : est ? tms(est.ml_est.start[1]) : 1e15;
+    rows.push({g, run, pend, est, key});
+  }
+  rows.sort((a, b) => a.key - b.key);
+  if (!rows.length){ wrap.innerHTML = `<div class="empty">${t("g_none")}</div>`; return; }
+  const MAX = 80, shown = rows.slice(0, MAX);
+  const W = vizWidth(wrap), LW = Math.min(300, W * 0.32), RH = 20, H = shown.length * RH;
+  const x = lin(t0, t1, LW, W - 8), cx = v => Math.max(LW, Math.min(W - 8, x(v)));
+  let b = timeTicks(t0, t1, x, H + 2, -6);
+  shown.forEach((r, i) => {
+    const y = i * RH, g = r.g, rep = r.est || r.run[0] || g.rep;
+    const cnt = Object.entries(g.counts).map(([s, n]) => `${SHORT[s] || s}${n}`).join(" ");
+    const label = `${g.cluster} · ${g.name}`;
+    b += `<g class="row" data-jump="${esc(jobKey(rep))}"><rect class="hl" x="0" y="${y}" width="${W}" height="${RH}" fill="transparent"/>`
+      + `<text class="lab" x="4" y="${y + 14}"${tip(`${label}  ×${g.jobs.length}\n${cnt}\n${t("g_click")}`)}>${esc(label.length > LW / 6.6 ? label.slice(0, Math.floor(LW / 6.6) - 1) + "…" : label)}</text>`;
+    for (const j of r.run.slice(0, 40)){
+      const s = tms(j.start), lim = durH(j.time_limit) || 24, e = s + lim * 3.6e6;
+      const tp = tip(t("g_tip_run", j.id, fmtTime(j.start), j.time_limit || "-"));
+      if (e > t0) b += `<rect x="${cx(s)}" y="${y + 4}" width="${Math.max(cx(now) - cx(s), 1)}" height="12" rx="2" fill="var(--ok)"${tp}/>`
+        + `<rect x="${cx(now)}" y="${y + 4}" width="${Math.max(cx(e) - cx(now), 0)}" height="12" rx="2" fill="var(--ok)" opacity="0.22"${tp}/>`;
+    }
+    if (r.est){
+      const [a, m, z] = r.est.ml_est.start.map(tms), lim = durH(r.est.time_limit) || 24, dep = !!r.est.dep_wait;
+      const tp = tip(t("g_tip_pd", r.est.id, fmtMs(a), fmtMs(m), fmtMs(z)));
+      if (a > t1) b += `<text x="${W - 8}" y="${y + 14}" text-anchor="end" style="fill:var(--warn)"${tp}>${esc(t("g_beyond", fmtMs(m)))}</text>`;
+      else {
+        b += `<rect x="${cx(m)}" y="${y + 8}" width="${Math.max(cx(m + lim * 3.6e6) - cx(m), 0)}" height="4" fill="var(--warn)" opacity="0.18"/>`
+          + `<rect x="${cx(a)}" y="${y + 3}" width="${Math.max(cx(z) - cx(a), 2)}" height="14" rx="2" fill="var(--warn)" opacity="${dep ? 0.12 : 0.32}"${dep ? ` stroke="var(--warn)" stroke-dasharray="3 2"` : ""}${tp}/>`
+          + (m <= t1 ? `<rect x="${cx(m) - 1}" y="${y + 2}" width="2.5" height="16" fill="var(--warn)"${tp}/>` : "");
+      }
+    }
+    b += `</g>`;
+  });
+  const xn = x(now);
+  b += `<line x1="${xn}" x2="${xn}" y1="-18" y2="${H}" stroke="var(--text)" stroke-dasharray="3 3"/><text x="${xn + 4}" y="-18" style="fill:var(--text)">${esc(t("g_now"))}</text>`;
+  wrap.innerHTML = legend([["", "background:var(--ok)", t("g_running")], ["", "background:var(--warn);opacity:.5", t("g_pending")],
+                           ["", "border:1px dashed var(--warn)", t("g_dep")]])
+    + `<div style="padding-top:28px">${svg(W, H + 4, b)}</div>` + (rows.length > MAX ? `<div class="more">${esc(t("g_more", rows.length - MAX))}</div>` : "");
+}
+
+// ---- ⑥ 排队预测：预测 vs 实际 ----
+const LOGT = [[0.1, "6m"], [1, "1h"], [10, "10h"], [96, "4d"]];
+function calibChart(){
+  const d = trendsData;
+  if (!d) return `<div class="empty">${t("tr_loading")}</div>`;
+  if (!d.ok) return `<div class="card-err">${esc(tr(d.error) || "error")}</div>`;
+  const order = ((lastData && lastData.clusters) || []).map(c => c.name);
+  const rank = c => (order.indexOf(c) + 1) || 99;
+  const panels = Object.entries(d.clusters).filter(([, v]) => v.calib.length).sort((a, b) => rank(a[0]) - rank(b[0])).map(([c, v]) => {
+    const W = 300, H = 230, L = 34, B = 26, lo = 0.02, hi = 400;
+    const x = logS(lo, hi, L, W - 6), y = logS(lo, hi, H - B, 6);
+    let b = "";
+    for (const [v0, lab] of LOGT){
+      b += `<line x1="${x(v0)}" x2="${x(v0)}" y1="6" y2="${H - B}" stroke="var(--c-grid)"/><line x1="${L}" x2="${W - 6}" y1="${y(v0)}" y2="${y(v0)}" stroke="var(--c-grid)"/>`
+        + `<text x="${x(v0)}" y="${H - B + 13}" text-anchor="middle">${lab}</text><text x="${L - 4}" y="${y(v0) + 4}" text-anchor="end">${lab}</text>`;
+    }
+    // 2 倍以内的带子 + 对角线
+    b += `<path d="M${x(lo)},${y(lo * 2)} L${x(hi / 2)},${y(hi)} L${x(hi)},${y(hi)} L${x(hi)},${y(hi / 2)} L${x(lo * 2)},${y(lo)} L${x(lo)},${y(lo)} Z" fill="#ffffff" opacity="0.05"/>`
+      + `<line x1="${x(lo)}" y1="${y(lo)}" x2="${x(hi)}" y2="${y(hi)}" stroke="var(--muted)" stroke-dasharray="3 3"/>`;
+    // 按 job 数 + 按批数（一批一份）各算一次"2 倍以内"
+    let ok = 0;
+    const bsize = {}, bok = {};
+    for (const c of v.calib) bsize[c[3]] = (bsize[c[3]] || 0) + 1;
+    for (const [p, a, id, bk] of v.calib){
+      const P = Math.max(p, lo), A = Math.max(a, lo);
+      const hit = Math.abs(p - a) <= 0.25 || (p <= 2 * a && a <= 2 * p);
+      ok += hit; bok[bk] = (bok[bk] || 0) + hit / bsize[bk];
+      b += `<circle cx="${x(P)}" cy="${y(A)}" r="3" fill="var(--c1)" fill-opacity="0.55" stroke="var(--panel)" stroke-width="0.8"${tip(t("cal_tip", id, fmtH(p), fmtH(a)))}/>`;
+    }
+    b += `<text x="${W - 6}" y="${H - 1}" text-anchor="end">${esc(t("cal_x"))} →</text><text x="${L + 4}" y="16">↑ ${esc(t("cal_y"))}</text>`;
+    const nb = Object.keys(bsize).length, bhit = Object.values(bok).reduce((x, y) => x + y, 0) / nb;
+    return `<div><div class="sub" style="color:var(--text)">${esc(t("cal_title", c, v.calib.length, nb, pct(ok / v.calib.length), pct(bhit)))}</div>${svg(W, H, b, true)}</div>`;
+  });
+  return `<div class="sub">${esc(t("cal_head"))}</div>` + (panels.length ? `<div class="small-multiples">${panels.join("")}</div>` : `<div class="empty">${t("cal_none")}</div>`);
+}
+
+// ---- ⑦ + ④ 排队历史：job 数 → 用量 → 优先级 → 等待，共用时间轴 ----
+function trendChart(el){
+  const d = trendsData;
+  if (!d) return `<div class="empty">${t("tr_loading")}</div>`;
+  if (!d.ok) return `<div class="card-err">${esc(tr(d.error) || "error")}</div>`;
+  const days = +hist.days || 365, now = tms(d.now), since = now - days * 864e5;
+  const W = vizWidth(el), L = 64, R = 10;
+  const out = [];
+  const order = ((lastData && lastData.clusters) || []).map(c => c.name);
+  const rank = c => (order.indexOf(c) + 1) || 99;
+  for (const [c, v] of Object.entries(d.clusters).sort((a, b) => rank(a[0]) - rank(b[0]))){
+    if (hist.cluster && c !== hist.cluster) continue;
+    const inR = arr => arr.filter(p => tms(p[0]) >= since);
+    const jobs = inR(v.jobs), use = inR(v.usage), prio = inR(v.prio), waits = inR(v.waits);
+    if (!jobs.length && !waits.length && !prio.length) continue;
+    // 从有数据的时候开始画
+    const first = Math.min(...[jobs, use.filter(p => p[1] > 0), prio, waits].filter(a => a.length).map(a => tms(a[0][0])));
+    const t0 = Math.max(since, first), x = lin(t0, now, L, W - R);
+    const use2 = use.filter(p => tms(p[0]) >= t0);
+    const strips = [["jobs", 64, t("tr_jobs")], ["usage", 48, t("tr_usage", d.usage_half_days)], ["prio", 48, t("tr_prio")], ["wait", 70, t("tr_wait")]];
+    let y = 0, b = "";
+    for (const [kind, h, title] of strips){
+      b += `<text x="${L}" y="${y + 10}" style="fill:var(--text)">${esc(title)}</text>`;
+      const top = y + 16, bot = y + 16 + h;
+      b += `<line x1="${L}" x2="${W - R}" y1="${bot}" y2="${bot}" stroke="var(--border)"/>`;
+      if (kind === "jobs" && jobs.length){
+        const mx = Math.max(1, ...jobs.map(p => Math.max(p[1], p[2]))), yy = lin(0, mx, bot, top);
+        const step = k => jobs.map((p, i) => i ? `H${x(tms(p[0]))}V${yy(p[k])}` : `M${x(tms(p[0]))},${yy(p[k])}`).join("") + `H${x(now)}`;
+        b += `<path d="${step(2)}" fill="none" stroke="var(--warn)" stroke-width="1.6"/><path d="${step(1)}" fill="none" stroke="var(--ok)" stroke-width="2"/>`
+          + `<text x="${L - 6}" y="${top + 4}" text-anchor="end">${mx}</text><text x="${L - 6}" y="${bot}" text-anchor="end">0</text>`;
+        jobs.forEach((p, i) => {
+          const xa = x(tms(p[0])), xb = i + 1 < jobs.length ? x(tms(jobs[i + 1][0])) : x(now);
+          b += `<rect x="${xa}" y="${top}" width="${Math.max(xb - xa, 1)}" height="${h}" fill="transparent"${tip(t("tr_tip_jobs", fmtTime(p[0]), p[1], p[2]))}/>`;
+        });
+      } else if (kind === "usage" && use2.length){
+        const use = use2;
+        const mx = Math.max(1, ...use.map(p => p[1])), yy = lin(0, mx, bot, top);
+        const line = use.map((p, i) => `${i ? "L" : "M"}${x(tms(p[0]))},${yy(p[1])}`).join("");
+        b += `<path d="${line}L${x(tms(use[use.length - 1][0]))},${bot}L${x(tms(use[0][0]))},${bot}Z" fill="var(--c1)" opacity="0.18"/><path d="${line}" fill="none" stroke="var(--c1)" stroke-width="2"/>`
+          + `<text x="${L - 6}" y="${top + 4}" text-anchor="end">${kFmt(mx)}</text>`;
+        use.forEach((p, i) => {
+          const xa = x(tms(p[0])), xb = i + 1 < use.length ? x(tms(use[i + 1][0])) : xa + 2;
+          b += `<rect x="${xa - (xb - xa) / 2}" y="${top}" width="${Math.max(xb - xa, 1)}" height="${h}" fill="transparent"${tip(t("tr_tip_usage", fmtTime(p[0]), kFmt(p[1])))}/>`;
+        });
+      } else if (kind === "prio" && prio.length){
+        const vals = prio.map(p => p[1]), lo = Math.min(...vals), hi = Math.max(...vals), yy = lin(lo, hi === lo ? lo + 1 : hi, bot - 3, top + 3);
+        for (const p of prio) b += `<circle cx="${x(tms(p[0]))}" cy="${yy(p[1])}" r="2.6" fill="var(--c2)" fill-opacity="0.7"${tip(t("tr_tip_prio", fmtTime(p[0]), p[1]))}/>`;
+        b += `<text x="${L - 6}" y="${top + 6}" text-anchor="end">${kFmt(hi)}</text><text x="${L - 6}" y="${bot}" text-anchor="end">${kFmt(lo)}</text>`;
+      } else if (kind === "wait" && waits.length){
+        const yy = logS(0.02, Math.max(100, ...waits.map(p => p[1])), bot - 3, top + 3);
+        for (const [v0, lab] of LOGT) if (v0 < Math.max(100, ...waits.map(p => p[1])))
+          b += `<line x1="${L}" x2="${W - R}" y1="${yy(v0)}" y2="${yy(v0)}" stroke="var(--c-grid)"/><text x="${L - 6}" y="${yy(v0) + 4}" text-anchor="end">${lab}</text>`;
+        for (const p of waits) b += `<circle cx="${x(tms(p[0]))}" cy="${yy(Math.max(p[1], 0.02))}" r="2.6" fill="var(--c3)" fill-opacity="0.7"${tip(t("tr_tip_wait", p[2], fmtTime(p[0]), fmtH(p[1])))}/>`;
+      } else b += `<text x="${L}" y="${top + h / 2}">${esc(t("tr_none"))}</text>`;
+      y = bot + 8;
+    }
+    // 时间刻度（画在最上面一层，竖线贯穿各条）
+    const ticks = timeTicks(t0, now, x, y, y + 13);
+    out.push(`<div class="sub" style="color:var(--text);font-weight:600">${esc(c)}</div>` + svg(W, y + 16, ticks + b));
+  }
+  return `<div class="sub">${esc(t("tr_head", +hist.days || "∞"))}</div>` + (out.join("") || `<div class="empty">${t("tr_none")}</div>`);
+}
+let resizeTimer = null;
+window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (lastData){ renderJobs(); renderHistory(); } }, 200); });
+
+// ---------------- fairshare / 排位（Slurm 的 sshare / sprio） ----------------
+const kFmt = n => n >= 1e6 ? +(n / 1e6).toPrecision(3) + "M" : n >= 1e3 ? +(n / 1e3).toPrecision(3) + "k" : String(+(+n).toPrecision(3));
+const sig = x => x === null || x === undefined ? "?" : String(+x.toPrecision(2));
+// 前面的越多越红
+const rankCls = (ahead, total) => ahead / total < 0.25 ? "h-ok" : ahead / total < 0.75 ? "h-mid" : "h-bad";
+// LevelFS = 份额 / 实际用量
+const shareTxt = a => a.eff_usage === 0 ? t("fs_unused") : a.level_fs ? t("fs_used_x", sig(1 / a.level_fs)) : "";
+function prioTip(j){
+  const p = j.prio;
+  const f = Object.entries(p.factors).filter(([, v]) => v).map(([k, v]) => `${k} ${v}`).join(" + ");
+  return t("prio_tip", p.priority, f) + Object.entries(p.parts).map(([pn, x]) =>
+    "\n" + (x.competing ? t("prio_tip_part", pn, x.ahead + 1, x.competing + 1, x.users_ahead) : t("prio_tip_alone", pn))).join("");
+}
+// 排队 job 的排位：多个候选分区取最靠前的那个
+function rankTag(j){
+  const ps = j.prio ? Object.values(j.prio.parts || {}).filter(x => x.competing) : [];
+  if (!ps.length) return "";
+  const x = ps.reduce((a, b) => b.ahead < a.ahead ? b : a);
+  return ` <span class="rank ${rankCls(x.ahead, x.competing + 1)}" title="${esc(prioTip(j))}">#${x.ahead + 1}/${x.competing + 1}</span>`;
+}
+// 卡片底部一行：fairshare、和别人比、优先级主要看什么
+function fairshareLine(c){
+  const fs = c.fairshare;
+  if (!fs) return "";
+  const accts = [...(fs.accounts || [])].sort((a, b) => (a.fairshare ?? 0) - (b.fairshare ?? 0));
+  const vals = accts.map(a => a.fairshare).filter(v => v !== null && v !== undefined);
+  const main = accts.length === 1 ? t("fs_one", sig(accts[0].fairshare), shareTxt(accts[0]))
+    : vals.length ? t("fs_many", sig(Math.min(...vals)), sig(Math.max(...vals)), accts.length) : "fairshare ?";
+  const u = fs.users || {};
+  const cmp = fs.sees_others && u.with_pending ? t("fs_cmp", rankCls(u.higher_fairshare, u.with_pending), u.higher_fairshare, u.with_pending) : "";
+  const w = Object.entries(fs.weights || {}).filter(([, v]) => v > 1).sort((a, b) => b[1] - a[1]);
+  const lead = !w.length ? "" : t("fs_lead", w.length === 1 || w[0][1] >= 10 * w[1][1] ? w[0][0] : `${w[0][0]} + ${w[1][0]}`);
+  const tip = [t("fs_tip"), t("fs_weights") + w.map(([k, v]) => `${k} ${kFmt(v)}`).join(", "),
+    ...(accts.length > 1 ? accts.map(a => `${a.account}: ${sig(a.fairshare)}  ${shareTxt(a)}`) : [])].join("\n");
+  return `<div class="card-foot" title="${esc(tip)}">${[main, cmp, lead].filter(Boolean).join(" · ")}</div>`;
+}
+
 // ---------------- 单元格 ----------------
 function whereCell(j){
   if (ACTIVE.has(j.state)) return esc(j.nodelist || "-");
-  if (PEND.has(j.state)) return `<span class="muted">${esc(j.reason || "-")}</span>`;
+  if (PEND.has(j.state)) return `<span class="muted">${esc(j.reason || "-")}</span>${rankTag(j)}`;
   return `<span class="muted">${esc(j.nodelist || "")}</span>`;
 }
 function timeUsedCell(j){
@@ -858,6 +1321,7 @@ function renderJobs(){
       }
     }
   }
+  renderGantt(groups);
   document.getElementById("jobsBody").innerHTML = rows.join("")
     || `<tr><td colspan="11" class="empty">${t("no_match")}</td></tr>`;
   document.getElementById("summary").textContent = t("summary", groups.length, nJobs);
@@ -869,11 +1333,12 @@ function renderJobs(){
 
 // ---------------- QoS → 分区（合并了 QoS 面板、分区表和排队积压）----------------
 const nCell = (v, cls) => v === null || v === undefined ? `<span class="n-0">—</span>` : `<span class="${v ? cls : "n-0"}">${v}</span>`;
-// 运行 / 排队；"我的"里等依赖的 job 不算排队，放在运行数后面的括号里：2 (+5) / 98
-const depTag = d => d ? ` <span class="dep-n" title="${esc(t("dep_tip"))}">(+${d})</span>` : "";
+// 运行 / 排队；"我的"里等依赖的 job 不算排队，按依赖链的根放在括号里：
+// 根在跑的放运行数后面，根还在排队的放排队数后面：4 (+15) / 410 (+378)
+const depTag = (d, side) => d ? ` <span class="dep-n" title="${esc(t(side === "run" ? "dep_tip_run" : "dep_tip_queue"))}">(+${d})</span>` : "";
 const pairCell = (r, m) => {
-  const pd = r[m + "_pending"], dep = r[m + "_dep"] || 0;
-  return `${nCell(r[m + "_running"], "n-r")}${depTag(dep)} / ${nCell(pd === null || pd === undefined ? pd : pd - dep, "n-pd")}`;
+  const pd = r[m + "_pending"], dep = r[m + "_dep"] || 0, depRun = r[m + "_dep_run"] || 0;
+  return `${nCell(r[m + "_running"], "n-r")}${depTag(depRun, "run")} / ${nCell(pd === null || pd === undefined ? pd : pd - dep, "n-pd")}${depTag(dep - depRun, "queue")}`;
 };
 // 节点 / CPU：已用 / 空闲 / 总数（只有 scontrol 时只有总数）
 const useCell = x => !x ? `<span class="n-0">—</span>` : x.idle === undefined ? `<span class="muted">${x.total}</span>`
@@ -910,20 +1375,56 @@ function overviewCard(c){
   const col = {
     all: hasF(c, "cluster_load"),
     nodes: parts.some(p => p.nodes), cpus: parts.some(p => p.cpus),
-    bl: parts.some(p => p.backlog),
-    ml: ov.groups.some(g => g.children.some(ch => ch.ml)),
+    // 预计等待：模型（粗体）+ 积压估计（≤ 上界）合成一列
+    wait: parts.some(p => p.backlog) || ov.groups.some(g => g.children.some(ch => ch.ml)),
     lim: hasF(c, "qos_info"),
   };
-  const nCols = 4 + col.all + col.nodes + col.cpus + 2 * col.bl + col.ml + col.lim;
+  // 排位：每个分区里我最靠前的排队 job（只有看得到别人 job 的集群才有）
+  const fsParts = (c.fairshare || {}).partitions || {}, rankBy = {};
+  if (c.fairshare && c.fairshare.sees_others)
+    for (const j of lastData.jobs || []){
+      if (j.cluster !== c.name || !PEND.has(j.state) || !j.prio) continue;
+      for (const [pn, x] of Object.entries(j.prio.parts || {})){
+        const r = rankBy[pn] || (rankBy[pn] = {n: 0, best: x, lo: x.priority, hi: x.priority, aheads: []});
+        r.n++;
+        r.aheads.push(x.ahead);
+        if (x.ahead < r.best.ahead) r.best = x;
+        r.lo = Math.min(r.lo, x.priority); r.hi = Math.max(r.hi, x.priority);
+      }
+    }
+  col.rank = Object.keys(rankBy).length > 0;
+  // 每个分区里我在跑的 job 数（画在排位条最前面）
+  const runBy = {};
+  if (c.fairshare && c.fairshare.sees_others)
+    for (const j of lastData.jobs || [])
+      if (j.cluster === c.name && ACTIVE.has(j.state) && j.partition) runBy[j.partition] = (runBy[j.partition] || 0) + 1;
+  // 图表只有在有占用条或排位时才有内容；看不到节点占用、也没有排位的集群（如 bluebear）直接显示表格
+  const vizOk = col.rank || Object.keys(runBy).length > 0 || parts.some(p => (p.nodes && p.nodes.idle !== undefined) || (p.cpus && p.cpus.idle !== undefined));
+  const nCols = 4 + col.all + col.nodes + col.cpus + col.wait + col.lim + col.rank;
+  const rankCell = pname => {
+    const r = rankBy[pname], st = fsParts[pname];
+    if (!r) return `<td><span class="n-0">—</span></td>`;
+    const mine = kFmt(r.lo) + (kFmt(r.hi) !== kFmt(r.lo) ? "–" + kFmt(r.hi) : "");
+    if (!st || !r.best.competing) return `<td title="${esc(t("rank_alone", pname, r.n))}"><b class="h-ok">#1</b><span class="rng">/ 1</span></td>`;
+    const tip = t("rank_tip", pname, r.n, r.best.ahead + 1, st.competing + 1, r.best.users_ahead, st.users, mine, kFmt(st.median));
+    return `<td title="${esc(tip)}"><b class="${rankCls(r.best.ahead, st.competing + 1)}">#${r.best.ahead + 1}</b><span class="rng">/ ${st.competing + 1}</span></td>`;
+  };
   // 模型预测：每个分区按"你在这里交过的典型 job"现在交要排多久；这个集群里最快的（数据够的）标"最快"
   let fastest = null;
   for (const g of ov.groups) for (const ch of g.children)
     if (ch.ml && !ch.hidden && ch.ml.n_seen >= 3 && (!fastest || ch.ml.wait[1] < fastest.ml.wait[1])) fastest = {...ch, qos: g.qos};
-  const mlCell = m => {
-    if (!m) return `<td><span class="n-0">—</span></td>`;
-    const [a, b, d] = m.wait, few = m.n_seen < 3, j = m.job;
-    const tip = t("ml_tree_tip", t("ml_rec_form", {cpus: j.cpus, gpus: j.gpus, nodes: j.nodes, time_h: Math.round(j.time_h * 10) / 10}), j.own, fmtH(a), fmtH(d), m.n_seen);
-    return `<td title="${esc(tip)}"><span class="${few ? "n-0" : hCls(b)}">~${fmtH(b)}</span><span class="rng">${fmtH(a)} – ${fmtH(d)}</span>${few ? ` <span class="tag full">${t("ml_few")}</span>` : ""}</td>`;
+  // 预计等待：粗体 = 模型 q50，小字 = q20–q80，"≤" = 积压估计（假设完美排满清空现在的活要多久，实际基本是上界）
+  const waitCell = (m, b) => {
+    const gpuJob = m ? m.job.gpus > 0 : false;
+    const ub = !b ? null : Math.max(b.cpu_max, ...(gpuJob || !m ? b.gpu.map(g => g.max) : []));
+    const blTip = !b ? "" : t("bl_tip_line", fmtH(b.cpu_min), fmtH(b.cpu_max))
+      + b.gpu.map(g => "\n" + t("bl_tip_gpu", g.type, fmtH(g.min), fmtH(g.max))).join("");
+    const ubHtml = ub === null ? "" : `<span class="ub">≤ ${fmtH(ub)}</span>`;
+    if (!m) return ub === null ? `<td><span class="n-0">—</span></td>` : `<td title="${esc(blTip)}">${ubHtml}</td>`;
+    const [a, mid, d] = m.wait, few = m.n_seen < 3, j = m.job;
+    const tip = t("ml_tree_tip", t("ml_rec_form", {cpus: j.cpus, gpus: j.gpus, nodes: j.nodes, time_h: Math.round(j.time_h * 10) / 10}), j.own, fmtH(a), fmtH(d), m.n_seen)
+      + (blTip ? "\n\n" + blTip : "");
+    return `<td title="${esc(tip)}"><b class="${few ? "n-0" : hCls(mid)}">~${fmtH(mid)}</b><span class="rng">${fmtH(a)} – ${fmtH(d)}</span>${ubHtml}${few ? ` <span class="tag full">${t("ml_few")}</span>` : ""}</td>`;
   };
   const loadTip = c.load_private ? t("load_private_tip") : t("load_tip");
   const allCell = r => !col.all ? "" : `<td title="${esc(loadTip)}">${c.load_private ? `<span class="n-0">${t("hidden")}</span>` : pairCell(r, "all")}</td>`;
@@ -933,19 +1434,16 @@ function overviewCard(c){
     const key = c.name + "|" + pname;
     const mine = counts.mine_running || counts.mine_pending;
     const down = p.avail && p.avail !== "up";
-    const b = p.backlog;
-    const gpu = !b ? `<span class="n-0">—</span>` : b.gpu.length
-      ? b.gpu.map(g => `<span class="gpuv"><span class="t">${esc(g.type)}</span> ${fmtRange(g.min, g.max)}</span>`).join("") : `<span class="n-0">—</span>`;
     const pq = p.part_qos ? `<span title="${esc(t("part_qos_tip"))}">${esc(p.part_qos)}</span>${p.part_qos_limits ? ": " + limitsText(p.part_qos_limits) : ""}` : "";
     return `<tr class="lvl1 ${under} ${mine ? "mine-row" : "idle"} ${down ? "down" : ""} ${filters.part === key ? "sel" : ""}" data-part="${esc(key)}">
       <td class="tog"></td>
       <td class="qname">${esc(pname)}${!under && fastest && fastest.name === pname && counts.ml && counts.ml.wait[1] === fastest.ml.wait[1] ? `<span class="tag fast" title="${esc(t("fastest_tip"))}">${t("fastest")}</span>` : ""}${p.default ? `<span class="tag cfg">${t("part_default")}</span>` : ""}${under && p.hidden ? `<span class="tag cfg">${t(p.hidden === "config" ? "hidden_config" : "hidden_empty")}</span>` : ""}${down ? `<span class="tag subfull">${esc(p.avail)}</span>` : ""}</td>
       <td class="mine" title="${esc(t("part_multi_tip"))}">${pairCell(counts, "mine")}</td>
+      ${col.rank ? rankCell(pname) : ""}
       ${col.all ? `<td title="${esc(t("part_multi_tip"))}">${c.load_private ? `<span class="n-0">—</span>` : pairCell(counts, "all")}</td>` : ""}
       ${col.nodes ? `<td title="${esc(t("nodes_tip"))}">${useCell(p.nodes)}</td>` : ""}
       ${col.cpus ? `<td title="${esc(t("nodes_tip"))}">${useCell(p.cpus)}</td>` : ""}
-      ${col.bl ? `<td title="${esc(t("bl_range_tip"))}">${b ? fmtRange(b.cpu_min, b.cpu_max) : `<span class="n-0">—</span>`}</td><td>${gpu}</td>` : ""}
-      ${col.ml ? mlCell(counts.ml) : ""}
+      ${col.wait ? waitCell(counts.ml, p.backlog) : ""}
       <td class="lim">${esc(p.time_limit || "-")}</td>
       ${col.lim ? `<td class="limits">${pq}</td>` : ""}
     </tr>`;
@@ -966,8 +1464,9 @@ function overviewCard(c){
       <td class="tog" ${shown.length ? `data-tree="${esc(key)}" title="${esc(t("n_parts", shown.length))}"` : ""}>${shown.length ? `<span class="tri">▶</span>` : ""}</td>
       <td class="qname">${esc(q.name)}${tags}${q.note ? `<span class="note">${esc(q.note)}</span>` : ""}${!open && shown.length ? `<span class="count">${esc(shown.map(x => x.name).join(", "))}</span>` : ""}</td>
       <td class="mine">${pairCell(q, "mine")}</td>
+      ${col.rank ? "<td></td>" : ""}
       ${allCell(q)}
-      ${col.nodes ? "<td></td>" : ""}${col.cpus ? "<td></td>" : ""}${col.bl ? "<td></td><td></td>" : ""}${col.ml ? (open ? "<td></td>" : mlCell(g.ml)) : ""}
+      ${col.nodes ? "<td></td>" : ""}${col.cpus ? "<td></td>" : ""}${col.wait ? (open || !g.ml ? "<td></td>" : waitCell(g.ml, ((ov.partitions || {})[g.ml.partition] || {}).backlog)) : ""}
       <td class="lim" title="${esc(t("th_maxwall_tip"))}">${esc(q.max_wall || "-")}</td>
       ${col.lim ? `<td class="limits">${limitsText(q)}</td>` : ""}
     </tr>`);
@@ -982,7 +1481,7 @@ function overviewCard(c){
   }
 
   const sum = k => (c.qos || []).reduce((a, q) => a + (q[k] || 0), 0);
-  const mr = sum("mine_running"), md = sum("mine_dep"), mp = sum("mine_pending") - md;
+  const mr = sum("mine_running"), md = sum("mine_dep"), mdr = sum("mine_dep_run"), mp = sum("mine_pending") - md;
   // 积压：说明 / GPU 池 / 插队
   const bl = c.backlog;
   let foot = "";
@@ -995,21 +1494,21 @@ function overviewCard(c){
       + bl.cutters.map(x => `<tr><td>${esc(x.id)}</td><td>${esc(x.partition)}</td><td>${esc(x.account)}</td><td>${x.cpus}C/${x.gpus}G</td><td>${esc(x.limit)}</td><td>${esc(tr(x.reason))}</td></tr>`).join("")
       + `</tbody></table></details>`;
   }
+  foot = fairshareLine(c) + foot;
   const blAt = bl && bl.fetched_at ? ` · ${t("bl_title")} ${localTime(bl.fetched_at)}` : "";
   return `<div class="card">
-    <div class="card-h">${dot}${esc(c.name)}${authTag}<span class="muted">${t("mine_summary", mr, mp, md)}</span><span class="muted at">${c.ok ? t("data_at", localTime(c.at)) + blAt : ""}</span></div>
+    <div class="card-h">${dot}${esc(c.name)}${authTag}<span class="muted">${t("mine_summary", mr, mp, mdr, md - mdr)}</span><span class="muted at">${c.ok ? t("data_at", localTime(c.at)) + blAt : ""}</span></div>
     ${errHtml}
     ${ov.part_info || !parts.length ? "" : `<div class="stale-note" style="color:var(--muted)">${esc(t("part_no_info", c))}</div>`}
-    <table class="qos">
-      <thead><tr><th></th><th>${esc(c.qos_label || "QoS")} / ${t("th_part")}</th><th>${t("th_mine")}</th>
+    ${isChart("ov") && vizOk ? cardChart(c, ov, rankBy, fsParts, runBy) : `<table class="qos">
+      <thead><tr><th></th><th>${esc(c.qos_label || "QoS")} / ${t("th_part")}</th><th>${t("th_mine")}</th>${col.rank ? `<th title="${esc(t("th_rank_tip"))}">${t("th_rank")}</th>` : ""}
         ${col.all ? `<th title="${esc(loadTip)}">${t("th_all")}</th>` : ""}
         ${col.nodes ? `<th title="${esc(t("nodes_tip"))}">${t("th_nodes")}</th>` : ""}
         ${col.cpus ? `<th title="${esc(t("nodes_tip"))}">${t("th_cpus2")}</th>` : ""}
-        ${col.bl ? `<th title="${esc(t("bl_range_tip"))}">${t("th_cpu_bl")}</th><th>${t("th_gpu_bl")}</th>` : ""}
-        ${col.ml ? `<th title="${esc(t("th_ml_col_tip"))}">${t("th_ml_col")}</th>` : ""}
+        ${col.wait ? `<th title="${esc(t("th_wait_tip"))}">${t("th_wait")}</th>` : ""}
         <th>${t("th_tlimit")}</th>${col.lim ? `<th>${t("th_limits")}</th>` : ""}</tr></thead>
       <tbody>${rows.join("") || `<tr><td colspan="${nCols}" class="empty">${t("no_qos")}</td></tr>`}</tbody>
-    </table>${foot}</div>`;
+    </table>`}${foot}</div>`;
 }
 
 function renderFilters(){
@@ -1092,7 +1591,8 @@ function render(){
   jobsByKey = {};
   lastData.jobs.forEach(j => jobsByKey[jobKey(j)] = j);
   pendingInspect = new Set(lastData.inspect_pending || []);
-  renderFilters(); renderAlerts(); renderErrors(); renderOverview(); renderModel(); renderJobs(); renderUpdated(); renderAuto();
+  renderViewBtns();
+  renderFilters(); renderAlerts(); renderErrors(); renderOverview(); renderModel(); renderDone(); renderJobs(); renderUpdated(); renderAuto();
 }
 
 function setFilter(k, v){ filters[k] = v; savePref("filters", {...filters, search: ""}); render(); }
@@ -1110,7 +1610,68 @@ document.getElementById("ovGrid").addEventListener("click", e => {
   if (q) setFilter("qos", filters.qos === q.dataset.qos ? "" : q.dataset.qos);
 });
 document.getElementById("partChip").addEventListener("click", () => setFilter("part", ""));
+document.querySelectorAll(".viewBtn").forEach(b => b.addEventListener("click", () => {
+  views[b.dataset.view] = isChart(b.dataset.view) ? "data" : "chart";
+  savePref("views", views);
+  render(); renderHistory();
+}));
+// 时间线：点一行切到表格并跳过去
+document.getElementById("ganttWrap").addEventListener("click", e => {
+  const el = e.target.closest("[data-jump]");
+  if (!el) return;
+  views.jobs = "data"; savePref("views", views);
+  renderViewBtns(); renderJobs();
+  jumpTo(el.dataset.jump);
+});
 document.getElementById("ovToggle").addEventListener("click", () => { ovCollapsed = !ovCollapsed; savePref("ovCollapsed", ovCollapsed); renderOverview(); });
+
+// ---------------- 上次刷新以来结束的 job ----------------
+let doneCollapsed = loadPref("doneCollapsed", false);
+function renderDone(){
+  const cs = ((lastData && lastData.clusters) || []).filter(c => c.just_done && (!filters.cluster || c.name === filters.cluster));
+  const sec = document.getElementById("doneSec");
+  justDone = new Set();
+  const all = (lastData.clusters || []).filter(c => c.just_done);
+  sec.style.display = all.length ? "" : "none";
+  if (!all.length) return;
+  for (const c of all) for (const id of c.just_done.ids) justDone.add(c.name + ":" + id);
+  const jobs = [];
+  for (const c of cs){
+    for (const id of c.just_done.ids){ const j = jobsByKey[c.name + ":" + id]; if (j) jobs.push(j); }
+    jobs.push(...c.just_done.gone);
+  }
+  // 出问题的在前，然后按结束时间新的在前
+  const bad = j => BAD.has(j.state) || j.gone ? 0 : 1;
+  jobs.sort((a, b) => bad(a) - bad(b) || (b.end || "").localeCompare(a.end || ""));
+  const counts = {};
+  for (const j of jobs) counts[j.state] = (counts[j.state] || 0) + 1;
+  document.getElementById("doneCounts").innerHTML = countPills({counts});
+  const lt = x => new Date(x).toLocaleString([], {month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"});
+  document.getElementById("doneSince").innerHTML = cs.map(c => `<b>${esc(c.name)}</b> ${t("done_since", lt(c.just_done.since), lt(c.just_done.until))}`).join(" · ")
+    + ` · ${t("done_hint")}`;
+  const wrap = document.getElementById("doneWrap");
+  wrap.style.display = doneCollapsed ? "none" : "";
+  document.getElementById("doneToggle").textContent = doneCollapsed ? t("expand") : t("collapse");
+  if (doneCollapsed) return;
+  if (!jobs.length){ wrap.innerHTML = `<div class="empty">${t("done_none")}</div>`; return; }
+  const exitCell = j => !j.exit_code || /^0(:0)?$/.test(j.exit_code) ? `<span class="muted">${esc(j.exit_code || "-")}</span>` : `<span class="bad-tag">${esc(j.exit_code)}</span>`;
+  wrap.innerHTML = `<table><thead><tr><th>${t("col_name")}</th><th>${t("col_cluster")}</th><th>Job ID</th><th>${t("col_state")}</th>
+    <th>${t("done_exit")}</th><th>QoS</th><th>${t("col_partition")}</th><th>${t("done_ran")}</th><th>${t("done_end")}</th></tr></thead><tbody>`
+    + jobs.map(j => `<tr data-jump="${esc(jobKey(j))}" title="${esc(j.gone ? t("done_gone_tip") : jobTip(j))}">
+      <td class="name">${esc(j.name)}</td><td>${esc(j.cluster)}</td>
+      <td class="jid" data-copy="${esc(j.id)}" title="${t("click_copy")}">${esc(j.id)}</td>
+      <td>${j.gone ? `<span class="tag full">${t("done_gone")}</span>` : stBadge(j.state)}</td>
+      <td>${j.gone ? "" : exitCell(j)}</td><td>${esc(j.qos || "-")}</td><td class="part">${esc(j.partition || "-")}</td>
+      <td class="num">${j.gone ? "" : `${esc(j.time_used || "-")} <span class="muted">/ ${esc(j.time_limit || "-")}</span>`}</td>
+      <td class="num">${j.gone ? "" : fmtTime(j.end)}</td></tr>`).join("") + `</tbody></table>`;
+}
+document.getElementById("doneToggle").addEventListener("click", () => { doneCollapsed = !doneCollapsed; savePref("doneCollapsed", doneCollapsed); renderDone(); });
+document.getElementById("doneWrap").addEventListener("click", e => {
+  const copy = e.target.closest("[data-copy]");
+  if (copy){ copyText(copy.dataset.copy).then(() => toast(t("copied", copy.dataset.copy))); return; }
+  const row = e.target.closest("[data-jump]");
+  if (row) jumpTo(row.dataset.jump);
+});
 
 // ---------------- 排队预测 ----------------
 let mlCollapsed = loadPref("mlCollapsed", true);
@@ -1154,6 +1715,11 @@ function renderModel(){
     }
     const hist = (meta.history || []).slice(-6).filter(h => h.model);
     if (hist.length > 1) html += `<div class="muted">${t("ml_trend", hist.map(h => `${fmtTime(h.trained_at).slice(0, 5)} ${pct(h.model.hit)}`).join(" → "))}</div>`;
+    if (isChart("ml")){  // 图表：训练信息一行 + 预测 vs 实际
+      html = t("ml_meta", fmtTime(meta.trained_at), meta.n_samples, meta.n_started, meta.n_censored, meta.seconds)
+        + `<div class="viz" style="padding:6px 0 0">${calibChart()}</div>`;
+      loadTrends();
+    }
   }
   if (m.error) html += `<div class="card-err">${esc(tr(m.error))}</div>`;
   st.innerHTML = html;
@@ -1272,6 +1838,11 @@ function renderHistory(){
   csel.value = hist.cluster;
   document.getElementById("histDays").value = hist.days;
   const statsEl = document.getElementById("histStats"), jobsEl = document.getElementById("histJobs");
+  const chartEl = document.getElementById("histChart"), chart = isChart("hist");
+  chartEl.style.display = chart ? "" : "none";
+  statsEl.style.display = jobsEl.style.display = chart ? "none" : "";
+  document.getElementById("histSearch").style.display = chart ? "none" : "";
+  if (chart){ chartEl.innerHTML = trendChart(chartEl); loadTrends(); }
   const d = histData;
   if (!d){ statsEl.innerHTML = `<div class="empty">${t("hist_loading")}</div>`; jobsEl.innerHTML = ""; return; }
   if (!d.ok){ statsEl.innerHTML = `<div class="card-err">${esc(tr(d.error))}</div>`; jobsEl.innerHTML = ""; return; }

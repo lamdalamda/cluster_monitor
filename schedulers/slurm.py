@@ -1,10 +1,12 @@
 """Slurm：squeue / sacct / sacctmgr / sinfo"""
 
+import math
 import re
+from bisect import bisect_left
 
 import backlog
 
-from .base import ACTIVE, Scheduler, clean_time, parse_lines
+from .base import ACTIVE, PENDING, Scheduler, clean_time, parse_lines, sort_jobid
 
 SQUEUE_FIELDS = [
     "jobid",
@@ -42,11 +44,21 @@ SACCT_FIELDS = [
     "req_tres",
     "eligible",
     "workdir",
+    "exitcode",
 ]
 SACCT_FORMAT = (
     "JobID,JobName,State,Partition,QOS,NodeList,Elapsed,Timelimit,Submit,Start,End,"
-    "ReqTRES,Eligible,WorkDir"
+    "ReqTRES,Eligible,WorkDir,ExitCode"
 )
+
+SSHARE_FIELDS = ["account", "user", "raw_shares", "norm_shares", "raw_usage", "norm_usage", "eff_usage",
+                 "fairshare", "level_fs"]
+SSHARE_FORMAT = "Account,User,RawShares,NormShares,RawUsage,NormUsage,EffectvUsage,FairShare,LevelFS"
+# sprio 的各项都是"已乘权重"的分数，加起来就是 priority
+PRIO_FACTORS = ["age", "assoc", "fairshare", "jobsize", "partition", "qos", "site"]
+SPRIO_FIELDS = ["jobid", "pname", "user", "priority"] + PRIO_FACTORS + ["qos_name"]  # pname：分区名（partition 是分区因子）
+SPRIO_FORMAT = "%i|%r|%u|%Y|%A|%B|%F|%J|%P|%Q|%S|%n"
+SPRIO_W_FORMAT = "%A|%B|%F|%J|%P|%Q|%S"
 
 QOS_LIMIT_FIELDS = ["name", "max_jobs_pu", "max_submit_pu", "max_wall", "max_tres_pu"]
 QOS_LIMIT_FORMAT = "Name,MaxJobsPU,MaxSubmitPU,MaxWall,MaxTRESPU"
@@ -55,9 +67,10 @@ QOS_LIMIT_FORMAT = "Name,MaxJobsPU,MaxSubmitPU,MaxWall,MaxTRESPU"
 class Slurm(Scheduler):
     kind = "slurm"
     qos_label = "QoS"
+    HISTORY_SECTION = "SACCT"
     PARTITION_LOAD = True
     FEATURES = frozenset({"history", "cluster_load", "qos_info", "backlog", "est_start",
-                          "partition_info"})
+                          "partition_info", "fairshare"})
 
     def steps(self, want):
         steps = [("SQUEUE", f"squeue --me -h -o '{SQUEUE_FORMAT}'")]
@@ -75,6 +88,12 @@ class Slurm(Scheduler):
         if want.get("qos_info"):
             steps.append(("ASSOC", "sacctmgr -nP show assoc user=$USER format=qos"))
             steps.append(("QOS", f"sacctmgr -nP show qos format={QOS_LIMIT_FORMAT}"))
+        if want.get("fairshare"):
+            steps.append(("SSHARE", f"sshare -U -P -n -o {SSHARE_FORMAT}"))
+            steps.append(("SPRIO_W", f"sprio -w -o '{SPRIO_W_FORMAT}'"))
+            # 所有人排队中的 job 的优先级（每个候选分区一行），和排队原因（等依赖 / 被 hold 的不算在前面）
+            steps.append(("SPRIO", f"sprio -h -o '{SPRIO_FORMAT}'"))
+            steps.append(("PDREASON", "squeue --all -h -t PENDING -o '%A|%r'"))
         if want.get("backlog"):
             steps.append(("ME", "id -un"))
             steps.extend(backlog.COMMANDS)
@@ -84,7 +103,8 @@ class Slurm(Scheduler):
         return {"SQUEUE", "SACCT"} if self.has("history") else {"SQUEUE"}
 
     def optional_sections(self):
-        return {"PART", "PINFO"}  # 比如 bluebear：sinfo 报 slurm_load_node: Access/permission denied
+        # 比如 bluebear：sinfo 报 slurm_load_node: Access/permission denied
+        return {"PART", "PINFO", "SSHARE", "SPRIO_W", "SPRIO", "PDREASON"}
 
     def parse_jobs(self, sections, prev_jobs):
         name = self.cluster["name"]
@@ -143,6 +163,9 @@ class Slurm(Scheduler):
     def parse_qos_info(self, sections):
         return {"assoc": parse_assoc(sections.get("ASSOC", [])),
                 "limits": parse_qos_limits(sections.get("QOS", []))}
+
+    def parse_fairshare(self, sections, jobs):
+        return parse_fairshare(sections, jobs)
 
     def analyze_backlog(self, sections):
         me = (sections.get("ME") or [""])[0]
@@ -229,6 +252,7 @@ def parse_sacct(lines, cluster_name):
             "dependency_raw": "",
             "deps": [],
             "source": "sacct",
+            "exit_code": rec["exitcode"],  # "退出码:信号"，比如 1:0
         }
     return jobs
 
@@ -274,3 +298,87 @@ def parse_qos_limits(lines):
     for rec in parse_lines(lines, QOS_LIMIT_FIELDS):
         limits[rec.pop("name")] = rec
     return limits
+
+
+def num(v):
+    """空 / inf / nan -> None（inf 写进 JSON 会变成 Infinity，浏览器解析不了，整个页面挂掉）"""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def not_competing(reason):
+    """排队但现在不参与排序的：等依赖、被 hold、还没到开始时间"""
+    return reason.startswith("Dependency") or "held" in reason.lower() or reason == "BeginTime"
+
+
+def prio_hist(prios, bins=24):
+    """别人优先级的分布（网页画直方图用）：对数刻度等宽的 bins 个格子
+    {"edges": [bins+1 个边界], "counts": [bins 个数]}"""
+    lo, hi = max(min(prios), 1), max(max(prios), 2)
+    if hi <= lo:
+        hi = lo + 1
+    a, b = math.log(lo), math.log(hi)
+    counts = [0] * bins
+    for p in prios:
+        counts[min(int((math.log(max(p, lo)) - a) / (b - a) * bins), bins - 1)] += 1
+    return {"edges": [round(math.exp(a + (b - a) * k / bins)) for k in range(bins + 1)], "counts": counts}
+
+
+def parse_fairshare(sections, jobs):
+    accounts = [{**{k: num(v) for k, v in rec.items()}, "account": rec["account"], "user": rec["user"]}
+                for rec in parse_lines(sections.get("SSHARE", []), SSHARE_FIELDS)]
+    weights = {}
+    for line in sections.get("SPRIO_W", []):
+        vals = line.split("|")
+        if len(vals) == len(PRIO_FACTORS) and all(v.strip().isdigit() or not v.strip() for v in vals):
+            weights = {k: int(v) for k, v in zip(PRIO_FACTORS, vals) if v.strip()}
+    rows = parse_lines(sections.get("SPRIO", []), SPRIO_FIELDS)
+    if not accounts and not rows:
+        return None
+    for r in rows:
+        for k in ["priority"] + PRIO_FACTORS:
+            r[k] = int(num(r[k]) or 0)
+    mine = {jid for jid, j in jobs.items() if j["state"] in PENDING}
+    me = {a["user"] for a in accounts} | {r["user"] for r in rows if r["jobid"] in mine}
+    idle = {line.split("|", 1)[0] for line in sections.get("PDREASON", [])
+            if "|" in line and not_competing(line.split("|", 1)[1])}
+
+    # 别人参与排序的 job：每个分区按 (优先级高, jobid 小) 排好；每个用户在每个分区最靠前的位置
+    queue, best, users = {}, {}, {}
+    for r in rows:
+        if r["user"] in me:
+            continue
+        users[r["user"]] = max(users.get(r["user"], 0), r["fairshare"])
+        if r["jobid"] in idle:
+            continue
+        key = (-r["priority"], sort_jobid(r["jobid"]))
+        queue.setdefault(r["pname"], []).append(key)
+        b = best.setdefault(r["pname"], {})
+        b[r["user"]] = min(b.get(r["user"], key), key)
+    for keys in queue.values():
+        keys.sort()
+
+    out = {}
+    for r in rows:
+        if r["jobid"] not in mine:
+            continue
+        e = out.setdefault(r["jobid"], {"priority": r["priority"], "qos_name": r["qos_name"],
+                                        "factors": {k: r[k] for k in PRIO_FACTORS}, "parts": {}})
+        p, key = r["pname"], (-r["priority"], sort_jobid(r["jobid"]))
+        e["parts"][p] = {"priority": r["priority"], "ahead": bisect_left(queue.get(p, []), key),
+                         "users_ahead": sum(1 for k in best.get(p, {}).values() if k < key),
+                         "competing": len(queue.get(p, []))}
+        if r["priority"] > e["priority"]:  # 分区因子不同时各分区优先级不一样，记最高的那个
+            e.update(priority=r["priority"], factors={k: r[k] for k in PRIO_FACTORS})
+    my_fs = max([r["fairshare"] for r in rows if r["user"] in me] or [0])
+    # 每个分区别人参与排序的 job：几个、几个人、优先级中位数（和你的比）
+    parts = {p: {"competing": len(keys), "users": len(best[p]), "median": -keys[len(keys) // 2][0],
+                 "hist": prio_hist([-k[0] for k in keys])}
+             for p, keys in queue.items()}
+    return {"accounts": accounts, "weights": weights, "sees_others": bool(users),
+            "users": {"with_pending": len(users), "higher_fairshare": sum(v > my_fs for v in users.values()),
+                      "my_fairshare_points": my_fs},
+            "partitions": parts, "jobs": out}

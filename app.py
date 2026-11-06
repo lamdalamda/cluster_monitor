@@ -41,8 +41,9 @@ import jobfiles
 import predictor
 import schedulers
 import waitlog
+import textview
 from i18n import L, as_l, prefixed, suffixed
-from schedulers.base import ACTIVE, PENDING, sort_jobid, waiting_on_dependency
+from schedulers.base import ACTIVE, PENDING, dependency_sides, sort_jobid, waiting_on_dependency
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.yaml")
@@ -167,6 +168,23 @@ def dir_key(cluster, workdir):
     return f"{cluster}\u0000{workdir}"
 
 
+def finished_between(prev, r):
+    """上一次成功刷新到这一次之间结束的 job（成功、失败、取消都算）：
+    上次还在跑/排队、这次结束了的，加上上次还没有、这次已经结束了的（中间提交又跑完）。
+    上次在、这次哪里都找不到的（超出了历史记录的时间范围，或者 SGE 的记录还没写）单独放在 gone 里。"""
+    if not prev or not prev.get("at"):
+        return None
+    live = ACTIVE | PENDING
+    old, new = prev.get("jobs", {}), r["jobs"]
+    # 上次没拿到历史记录的话，"上次没有"不代表是新提交的，只看上次还在跑/排队的
+    ids = [jid for jid, j in new.items() if j["state"] not in live
+           and (old[jid]["state"] in live if jid in old else prev.get("history_ok", True))]
+    gone = [{**j, "state": "UNKNOWN", "gone": True} for jid, j in old.items()
+            if j["state"] in live and jid not in new]
+    return {"since": prev["at"], "until": r["at"], "ids": sorted(ids, key=sort_jobid),
+            "gone": sorted(gone, key=lambda j: sort_jobid(j["id"]))}
+
+
 class Backend:
     """所有 SSH 操作都放进 self.queue，由一个后台线程依次执行；网页只读 self 里的结果。"""
 
@@ -207,6 +225,7 @@ class Backend:
             self.predictor = predictor.Predictor(
                 os.path.join(APP_DIR, config.get("wait_model_path", "models/wait_model.pkl")),
                 config.get("wait_model_half_life_days", 14))
+            self.predictor.set_runs(self.waitlog)
         self.load_cache()
         self.annotate_all()
         # 自动刷新间隔（分钟，0 = 关）：网页上的下拉框改了存在 SETTINGS_PATH，否则用 config.yaml
@@ -357,11 +376,13 @@ class Backend:
         """标出不会开始的排队 job（never_run = 匹配到的原因），再给其余排队 job 加上
         模型预测的开始时间（ml_est）"""
         pats = self.config.get("never_run_reasons", DEFAULT_NEVER_RUN) or []
-        for j in r.get("jobs", {}).values():
+        sides = dependency_sides(r.get("jobs", {}))
+        for jid, j in r.get("jobs", {}).items():
             reason = (j.get("reason") or "").strip("()") if j["state"] in PENDING else ""
             j["never_run"] = reason if reason and any(fnmatch.fnmatchcase(reason, p) for p in pats) else ""
             # 在排队，但还在等前置 job：前端单独显示成"等依赖"，不算真正在排队
             j["dep_wait"] = j["state"] in PENDING and waiting_on_dependency(j)
+            j["dep_on"] = sides.get(jid, "")  # run = 依赖链的根在跑，queue = 根还在排队
         if self.predictor and r.get("jobs"):
             try:
                 self.predictor.annotate(r)
@@ -475,6 +496,8 @@ class Backend:
             if r["ok"] and self.waitlog and self.check_waitlog_size():
                 try:
                     self.waitlog.update(r)
+                    if self.predictor:
+                        self.predictor.set_runs(self.waitlog)  # 预测用的"我的用量"
                     with self.lock:
                         self.results.get("_errors", {}).pop("waitlog", None)
                 except Exception as e:  # noqa: BLE001  记录失败不影响刷新
@@ -494,6 +517,7 @@ class Backend:
         if r["ok"]:
             r["at"] = now_iso()
             r["stale_since"] = None
+            r["just_done"] = finished_between(self.last_good.get(name), r)
             self.last_good[name] = r
             self.results[name] = r
             return
@@ -642,9 +666,11 @@ class Backend:
                     "scheduler": r.get("scheduler", "slurm"), "qos_label": r.get("qos_label", "QoS"),
                     "features": r.get("features", sorted(schedulers.ALL_FEATURES)),
                     "backlog": r.get("backlog"), "overview": r.get("overview"),
+                    "just_done": r.get("just_done"), "fairshare": r.get("fairshare"),
                 })
             errors.extend(as_l(e) for e in self.results.get("_errors", {}).values())
             inspect, pending = self.inspect_view(jobs)
+            # parse_constant：inf / nan（json 里是 Infinity / NaN）换成 null，浏览器的 JSON.parse 不认它们
             return json.loads(json.dumps({
                 "version": self.version,
                 "progress": self.progress(),
@@ -661,7 +687,7 @@ class Backend:
                 "model": self.model_status(),
                 "settings": {"dir_size_warn_gb": self.config.get("dir_size_warn_gb", 30),
                              "dir_files_warn": self.config.get("dir_files_warn", 50)},
-            }))
+            }), parse_constant=lambda _: None)
 
     def inspect_view(self, jobs):
         """把按目录存的信息展开成每个 job 一份：只留这个 job 自己的 {id} 文件，
@@ -771,7 +797,8 @@ class Backend:
         )
         steps = sched.steps({"history_hours": cfg.get("history_hours", 48), "load": with_load,
                              "qos_info": with_qos_info, "backlog": with_backlog,
-                             "partition_info": sched.has("partition_info")})
+                             "partition_info": sched.has("partition_info"),
+                             "fairshare": sched.has("fairshare")})
 
         timeout_total = timeout * (2 if with_backlog else 1)
         try:
@@ -836,12 +863,24 @@ class Backend:
                 if j["state"] in PENDING and j.get("live"):
                     j["wait_est"] = sched.estimate_job(j, bl_cached["model"])
 
+        fairshare = None
+        if sched.has("fairshare"):
+            try:
+                fairshare = sched.parse_fairshare(sections, jobs)
+            except Exception as e:  # noqa: BLE001
+                warnings.append(L(f"fairshare 解析出错: {e}", f"Fairshare parsing failed: {e}"))
+        if fairshare:
+            for jid, p in fairshare.pop("jobs").items():
+                if jid in jobs:
+                    jobs[jid]["prio"] = p
+
         qos_table = self.build_qos_table(c, jobs, cached, load, with_load)
         bl_result = bl_cached["result"] if bl_cached else None
         return {"name": name, "ok": True, "error": None, "warnings": warnings,
+                "history_ok": sched.has("history") and sched.HISTORY_SECTION not in failed,
                 "load_private": load_private, "scheduler": sched.kind,
                 "features": sorted(sched.features), "qos_label": sched.qos_label,
-                "backlog": bl_result, "jobs": jobs, "qos": qos_table,
+                "backlog": bl_result, "fairshare": fairshare, "jobs": jobs, "qos": qos_table,
                 "overview": self.build_overview(c, jobs, qos_table, part_info, combo_load,
                                                 with_load and sched.PARTITION_LOAD,
                                                 cached["limits"], bl_result)}
@@ -863,15 +902,18 @@ class Backend:
 
         seen = set(combo)  # 见过的 (QoS, 分区)
         mine = {}  # (QoS, 分区) -> 我的 运行/排队
-        for j in jobs.values():
+        sides = dependency_sides(jobs)
+        for jid, j in jobs.items():
             q = j.get("qos") or ""
             for p in parts_of(j):
                 seen.add((q, p))
                 if j["state"] in ACTIVE | PENDING:
-                    # pending 里包括等依赖的（dep）：前端把它们从"排队"里拿出来，放在运行数后面的括号里
-                    m = mine.setdefault((q, p), {"running": 0, "pending": 0, "dep": 0})
+                    # pending 里包括等依赖的（dep）；其中 dep_run = 依赖链的根在跑的。
+                    # 前端：运行 (+dep_run) / 排队 (+其余等依赖的)
+                    m = mine.setdefault((q, p), {"running": 0, "pending": 0, "dep": 0, "dep_run": 0})
                     m["running" if j["state"] in ACTIVE else "pending"] += 1
-                    m["dep"] += j["state"] in PENDING and waiting_on_dependency(j)
+                    m["dep"] += jid in sides
+                    m["dep_run"] += sides.get(jid) == "run"
 
         parts = {r["name"]: dict(r) for r in part_info or []}
         for _, p in sorted(seen):  # 只在 job 里见过的分区（比如 SGE 的并行环境）
@@ -884,6 +926,7 @@ class Backend:
                 "mine_running": sum(v["running"] for v in tot_m),
                 "mine_pending": sum(v["pending"] for v in tot_m),
                 "mine_dep": sum(v["dep"] for v in tot_m),
+                "mine_dep_run": sum(v["dep_run"] for v in tot_m),
                 "all_running": sum(v["running"] for v in tot_a) if with_combo else None,
                 "all_pending": sum(v["pending"] for v in tot_a) if with_combo else None,
                 "part_qos_limits": limits.get(info.get("part_qos")) if info.get("part_qos") else None,
@@ -916,6 +959,7 @@ class Backend:
                 m, a = mine.get((q, p), {}), combo.get((q, p), {})
                 children.append({"name": p, "mine_running": m.get("running", 0),
                                  "mine_pending": m.get("pending", 0), "mine_dep": m.get("dep", 0),
+                                 "mine_dep_run": m.get("dep_run", 0),
                                  "all_running": a.get("running", 0) if with_combo else None,
                                  "all_pending": a.get("pending", 0) if with_combo else None})
             groups.append({"qos": row["name"], "children": children})
@@ -949,6 +993,7 @@ class Backend:
             if q and q not in seen:
                 rows.append({"name": q, "note": ""})
                 seen.add(q)
+        sides = dependency_sides(jobs)
 
         table = []
         for r in rows:
@@ -962,7 +1007,8 @@ class Backend:
                 "mine_running": sum(1 for j in mine if j["state"] in ACTIVE),
                 "mine_pending": sum(1 for j in mine if j["state"] in PENDING),
                 # 其中在等依赖的（不算真正在排队；mine_pending 仍然包括它们，waitlog / 模型用的是这个）
-                "mine_dep": sum(1 for j in mine if j["state"] in PENDING and waiting_on_dependency(j)),
+                "mine_dep": sum(1 for j in mine if j["id"] in sides),
+                "mine_dep_run": sum(1 for j in mine if sides.get(j["id"]) == "run"),
                 "all_running": load.get(q, {}).get("running", 0) if with_load else None,
                 "all_pending": load.get(q, {}).get("pending", 0) if with_load else None,
                 "max_jobs_pu": lim.get("max_jobs_pu", ""),
@@ -1065,6 +1111,18 @@ def api_history():
     return jsonify(h)
 
 
+@app.route("/api/trends")
+def api_trends():
+    """趋势图（排队历史那一块）：?days=21"""
+    if not backend.waitlog:
+        return jsonify({"ok": False, "error": L("没开 waitlog", "waitlog is off")})
+    try:
+        days = min(max(float(request.args.get("days") or 21), 1), 365)
+    except ValueError:
+        days = 21
+    return jsonify({"ok": True, **backend.waitlog.trends(days)})
+
+
 @app.route("/api/model")
 def api_model():
     return jsonify(backend.model_status())
@@ -1096,7 +1154,28 @@ def api_inspect():
     return jsonify({"ok": True, "added": added})
 
 
+# 纯文本视图（给 Claude / curl 用）：网页端口下的 /text/...，以及单独的 text_port（默认 8786）
+app.register_blueprint(textview.blueprint(backend), url_prefix="/text")
+text_app = Flask("textview")
+text_app.before_request(check_client_ip)
+text_app.register_blueprint(textview.blueprint(backend))
+
+
+def start_text_server():
+    port = config.get("text_port", 8786)
+    if not port:
+        return
+    from werkzeug.serving import make_server
+    try:
+        srv = make_server(config.get("host", "127.0.0.1"), port, text_app, threaded=True)
+    except OSError as e:
+        print(f"text_port {port}: {e}")
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True, name="text-server").start()
+
+
 if __name__ == "__main__":
     backend.start()
+    start_text_server()
     app.run(host=config.get("host", "127.0.0.1"), port=config.get("port", 8787), debug=False,
             threaded=True)
